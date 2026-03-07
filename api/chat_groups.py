@@ -261,7 +261,13 @@ async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend):
             params = None
             if body.parameters:
                 member_name = r["name"] or "there"
-                params = [p.replace("{member_name}", member_name) for p in body.parameters]
+                params = [
+                    p.replace("{member_name}", member_name)
+                     .replace("{member-name}", member_name)
+                     .replace("{first_name}", member_name.split()[0] if member_name != "there" else "there")
+                     .replace("{first-name}", member_name.split()[0] if member_name != "there" else "there")
+                    for p in body.parameters
+                ]
 
             wa_id = await send_template_message(
                 phone_number=phone,

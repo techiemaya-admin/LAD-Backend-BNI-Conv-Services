@@ -234,6 +234,184 @@ async def list_conversations(
         return {"success": False, "data": [], "total": 0, "error": str(e)}
 
 
+# ── Context statuses (tenant-specific) ────────────────────────────
+# NOTE: Static routes MUST be defined BEFORE parameterized /{conversation_id} routes
+# otherwise FastAPI will match "context-statuses" as a conversation_id.
+
+@router.get("/context-statuses")
+async def list_context_statuses():
+    """Return distinct context statuses that exist for this tenant's conversations."""
+    try:
+        async with ClientDBConnection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT cm.context_status, COUNT(*) AS count
+                FROM bni_conversation_manager cm
+                WHERE cm.context_status IS NOT NULL AND cm.context_status != ''
+                GROUP BY cm.context_status
+                ORDER BY count DESC
+                """
+            )
+            data = [
+                {"value": r["context_status"], "count": r["count"]}
+                for r in rows
+            ]
+            return {"success": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error listing context statuses: {e}", exc_info=True)
+        return {"success": True, "data": []}
+
+
+# ── Template messages ─────────────────────────────────────────────
+
+@router.get("/templates/debug")
+async def debug_templates():
+    """Diagnostic endpoint to check template config (non-sensitive)."""
+    from services.whatsapp_client import PHONE_NUMBER_ID, ACCESS_TOKEN, _get_waba_id
+    waba_id = await _get_waba_id()
+    return {
+        "phone_number_id_set": bool(PHONE_NUMBER_ID),
+        "phone_number_id_preview": PHONE_NUMBER_ID[:6] + "..." if PHONE_NUMBER_ID else "MISSING",
+        "access_token_set": bool(ACCESS_TOKEN),
+        "waba_id": waba_id or "NOT_RESOLVED",
+    }
+
+
+@router.get("/templates")
+async def list_templates():
+    """Return approved WhatsApp message templates from Meta API."""
+    try:
+        templates = await get_message_templates()
+        logger.info(f"Templates fetched: {len(templates)} templates found")
+        return {"success": True, "data": templates}
+    except Exception as e:
+        logger.error(f"Error fetching templates: {e}", exc_info=True)
+        return {"success": False, "data": [], "error": str(e)}
+
+
+# ── Bulk operations ──────────────────────────────────────────────
+
+@router.post("/bulk/send-template")
+async def bulk_send_template(body: BulkTemplateSendRequest):
+    """Send a WhatsApp template message to multiple conversations."""
+    try:
+        async with ClientDBConnection() as conn:
+            # Resolve phone numbers for all conversation IDs
+            rows = await conn.fetch(
+                """
+                SELECT c.id AS conversation_id, c.lead_id, l.phone, l.name
+                FROM conversations c
+                LEFT JOIN leads l ON l.id = c.lead_id
+                WHERE c.id = ANY($1::uuid[])
+                """,
+                body.conversation_ids,
+            )
+
+        sent = []
+        failed = []
+        for r in rows:
+            phone = r["phone"]
+            if not phone:
+                failed.append({"conversation_id": str(r["conversation_id"]), "reason": "No phone number"})
+                continue
+
+            # Substitute {member_name} / {member-name} in parameters if present
+            params = None
+            if body.parameters:
+                member_name = r["name"] or "there"
+                params = [
+                    p.replace("{member_name}", member_name)
+                     .replace("{member-name}", member_name)
+                     .replace("{first_name}", member_name.split()[0] if member_name != "there" else "there")
+                     .replace("{first-name}", member_name.split()[0] if member_name != "there" else "there")
+                    for p in body.parameters
+                ]
+
+            wa_id = await send_template_message(
+                phone_number=phone,
+                template_name=body.template_name,
+                language_code=body.language_code,
+                parameters=params,
+                conversation_id=str(r["conversation_id"]),
+                lead_id=str(r["lead_id"]) if r["lead_id"] else None,
+            )
+
+            if wa_id:
+                sent.append({"conversation_id": str(r["conversation_id"]), "wa_message_id": wa_id})
+            else:
+                failed.append({"conversation_id": str(r["conversation_id"]), "reason": "Send failed"})
+
+        return {
+            "success": True,
+            "data": {
+                "sent_count": len(sent),
+                "failed_count": len(failed),
+                "sent": sent,
+                "failed": failed,
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error bulk sending template: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/bulk/status")
+async def bulk_update_status(body: BulkStatusRequest):
+    """Update status for multiple conversations."""
+    if body.status not in ("active", "resolved", "muted"):
+        return {"success": False, "error": "Invalid status"}
+    try:
+        async with ClientDBConnection() as conn:
+            result = await conn.execute(
+                "UPDATE conversations SET status = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])",
+                body.status,
+                body.ids,
+            )
+            return {"success": True, "data": {"updated": len(body.ids)}}
+    except Exception as e:
+        logger.error(f"Error bulk updating status: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/bulk/labels")
+async def bulk_add_label(body: BulkLabelsRequest):
+    """Add a label to multiple conversations."""
+    try:
+        async with ClientDBConnection() as conn:
+            for cid in body.ids:
+                await conn.execute(
+                    """
+                    INSERT INTO conversation_labels (conversation_id, label_id)
+                    VALUES ($1::uuid, $2::uuid)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    cid,
+                    body.label_id,
+                )
+            return {"success": True, "data": {"updated": len(body.ids)}}
+    except Exception as e:
+        logger.error(f"Error bulk adding labels: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/bulk/delete")
+async def bulk_delete(body: BulkDeleteRequest):
+    """Soft-delete multiple conversations."""
+    try:
+        async with ClientDBConnection() as conn:
+            await conn.execute(
+                "UPDATE conversations SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1::uuid[])",
+                body.ids,
+            )
+            return {"success": True, "data": {"deleted": len(body.ids)}}
+    except Exception as e:
+        logger.error(f"Error bulk deleting: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+# ── Parameterized routes (MUST come AFTER static routes) ─────────
+
 @router.get("/{conversation_id}/messages")
 async def list_messages(
     conversation_id: str,
@@ -444,7 +622,7 @@ async def update_ownership(conversation_id: str, request: Request):
         return {"success": False, "error": str(e)}
 
 
-# ── New CRM actions ──────────────────────────────────────────────
+# ── CRM actions ──────────────────────────────────────────────────
 
 @router.patch("/{conversation_id}/favorite")
 async def toggle_favorite(conversation_id: str):
@@ -613,162 +791,4 @@ async def get_business_profile(conversation_id: str):
 
     except Exception as e:
         logger.error(f"Error fetching business profile: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
-
-
-# ── Context statuses (tenant-specific) ────────────────────────────
-
-@router.get("/context-statuses")
-async def list_context_statuses():
-    """Return distinct context statuses that exist for this tenant's conversations.
-
-    This makes the filter chips dynamic — each tenant only sees statuses
-    that actually exist in their data.
-    """
-    try:
-        async with ClientDBConnection() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT cm.context_status, COUNT(*) AS count
-                FROM bni_conversation_manager cm
-                WHERE cm.context_status IS NOT NULL AND cm.context_status != ''
-                GROUP BY cm.context_status
-                ORDER BY count DESC
-                """
-            )
-            data = [
-                {"value": r["context_status"], "count": r["count"]}
-                for r in rows
-            ]
-            return {"success": True, "data": data}
-    except Exception as e:
-        logger.error(f"Error listing context statuses: {e}", exc_info=True)
-        return {"success": True, "data": []}
-
-
-# ── Template messages ─────────────────────────────────────────────
-
-@router.get("/templates")
-async def list_templates():
-    """Return approved WhatsApp message templates from Meta API."""
-    try:
-        templates = await get_message_templates()
-        return {"success": True, "data": templates}
-    except Exception as e:
-        logger.error(f"Error fetching templates: {e}", exc_info=True)
-        return {"success": True, "data": []}
-
-
-@router.post("/bulk/send-template")
-async def bulk_send_template(body: BulkTemplateSendRequest):
-    """Send a WhatsApp template message to multiple conversations."""
-    try:
-        async with ClientDBConnection() as conn:
-            # Resolve phone numbers for all conversation IDs
-            rows = await conn.fetch(
-                """
-                SELECT c.id AS conversation_id, c.lead_id, l.phone, l.name
-                FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
-                WHERE c.id = ANY($1::uuid[])
-                """,
-                body.conversation_ids,
-            )
-
-        sent = []
-        failed = []
-        for r in rows:
-            phone = r["phone"]
-            if not phone:
-                failed.append({"conversation_id": str(r["conversation_id"]), "reason": "No phone number"})
-                continue
-
-            # Substitute {member_name} in parameters if present
-            params = None
-            if body.parameters:
-                member_name = r["name"] or "there"
-                params = [p.replace("{member_name}", member_name) for p in body.parameters]
-
-            wa_id = await send_template_message(
-                phone_number=phone,
-                template_name=body.template_name,
-                language_code=body.language_code,
-                parameters=params,
-                conversation_id=str(r["conversation_id"]),
-                lead_id=str(r["lead_id"]) if r["lead_id"] else None,
-            )
-
-            if wa_id:
-                sent.append({"conversation_id": str(r["conversation_id"]), "wa_message_id": wa_id})
-            else:
-                failed.append({"conversation_id": str(r["conversation_id"]), "reason": "Send failed"})
-
-        return {
-            "success": True,
-            "data": {
-                "sent_count": len(sent),
-                "failed_count": len(failed),
-                "sent": sent,
-                "failed": failed,
-            },
-        }
-
-    except Exception as e:
-        logger.error(f"Error bulk sending template: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
-
-
-# ── Bulk operations ──────────────────────────────────────────────
-
-@router.post("/bulk/status")
-async def bulk_update_status(body: BulkStatusRequest):
-    """Update status for multiple conversations."""
-    if body.status not in ("active", "resolved", "muted"):
-        return {"success": False, "error": "Invalid status"}
-    try:
-        async with ClientDBConnection() as conn:
-            result = await conn.execute(
-                "UPDATE conversations SET status = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])",
-                body.status,
-                body.ids,
-            )
-            return {"success": True, "data": {"updated": len(body.ids)}}
-    except Exception as e:
-        logger.error(f"Error bulk updating status: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
-
-
-@router.post("/bulk/labels")
-async def bulk_add_label(body: BulkLabelsRequest):
-    """Add a label to multiple conversations."""
-    try:
-        async with ClientDBConnection() as conn:
-            for cid in body.ids:
-                await conn.execute(
-                    """
-                    INSERT INTO conversation_labels (conversation_id, label_id)
-                    VALUES ($1::uuid, $2::uuid)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    cid,
-                    body.label_id,
-                )
-            return {"success": True, "data": {"updated": len(body.ids)}}
-    except Exception as e:
-        logger.error(f"Error bulk adding labels: {e}", exc_info=True)
-        return {"success": False, "error": str(e)}
-
-
-@router.post("/bulk/delete")
-async def bulk_delete(body: BulkDeleteRequest):
-    """Soft-delete multiple conversations."""
-    try:
-        async with ClientDBConnection() as conn:
-            await conn.execute(
-                "UPDATE conversations SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1::uuid[])",
-                body.ids,
-            )
-            return {"success": True, "data": {"deleted": len(body.ids)}}
-    except Exception as e:
-        logger.error(f"Error bulk deleting: {e}", exc_info=True)
         return {"success": False, "error": str(e)}

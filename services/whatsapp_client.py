@@ -7,8 +7,11 @@ import time
 import uuid
 
 import httpx
+from dotenv import load_dotenv
 
 from db.connection import ClientDBConnection
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ async def mark_as_read(message_id: str) -> None:
 
 
 WABA_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
+logger.info(f"WhatsApp config: PHONE_NUMBER_ID={'SET' if PHONE_NUMBER_ID else 'MISSING'}, ACCESS_TOKEN={'SET' if ACCESS_TOKEN else 'MISSING'}, WABA_ID={'SET' if WABA_ID else 'MISSING (will auto-discover)'}")
 
 # Cache for auto-discovered WABA ID
 _resolved_waba_id: str | None = None
@@ -91,7 +95,9 @@ async def _get_waba_id() -> str:
 
 async def get_message_templates() -> list[dict]:
     """Fetch approved message templates from Meta Business API."""
+    logger.info(f"get_message_templates called. PHONE_NUMBER_ID={PHONE_NUMBER_ID[:6] if PHONE_NUMBER_ID else 'MISSING'}..., ACCESS_TOKEN={'SET' if ACCESS_TOKEN else 'MISSING'}")
     waba_id = await _get_waba_id()
+    logger.info(f"Resolved WABA ID: {waba_id or 'EMPTY'}")
     if not waba_id or not ACCESS_TOKEN:
         logger.warning("Cannot fetch templates: WABA ID not available. Set WHATSAPP_BUSINESS_ACCOUNT_ID in .env")
         return []
@@ -179,7 +185,7 @@ async def send_template_message(
             # Build a readable content string for DB storage
             content = f"[Template: {template_name}]"
             if parameters:
-                content += f" params={parameters}"
+                content += f"\n{', '.join(str(p) for p in parameters)}"
 
             if conversation_id and lead_id:
                 await _save_outgoing_message(

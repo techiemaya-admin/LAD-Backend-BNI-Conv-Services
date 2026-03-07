@@ -22,6 +22,7 @@ from api.labels import router as labels_router
 from api.quick_replies import router as quick_replies_router
 from api.notes import router as notes_router
 from api.chat_groups import router as chat_groups_router
+from api.prompts import router as prompts_router
 from tasks.reminder_task import send_meeting_reminders
 from tasks.followup_task import send_post_meeting_followups
 from tasks.icp_followup_task import send_icp_followups
@@ -85,3 +86,4 @@ app.include_router(labels_router)
 app.include_router(quick_replies_router)
 app.include_router(notes_router)
 app.include_router(chat_groups_router)
+app.include_router(prompts_router)
