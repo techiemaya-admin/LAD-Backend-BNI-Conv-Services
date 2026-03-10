@@ -93,8 +93,14 @@ async def _get_waba_id() -> str:
     return ""
 
 
+# Cache for template body texts: {template_name: body_text}
+_template_body_cache: dict[str, str] = {}
+_template_cache_loaded: bool = False
+
+
 async def get_message_templates() -> list[dict]:
     """Fetch approved message templates from Meta Business API."""
+    global _template_cache_loaded
     logger.info(f"get_message_templates called. PHONE_NUMBER_ID={PHONE_NUMBER_ID[:6] if PHONE_NUMBER_ID else 'MISSING'}..., ACCESS_TOKEN={'SET' if ACCESS_TOKEN else 'MISSING'}")
     waba_id = await _get_waba_id()
     logger.info(f"Resolved WABA ID: {waba_id or 'EMPTY'}")
@@ -123,6 +129,9 @@ async def get_message_templates() -> list[dict]:
                         import re
                         params = re.findall(r"\{\{(\d+)\}\}", body_text)
 
+                # Cache body text for use in send_template_message
+                _template_body_cache[t["name"]] = body_text
+
                 templates.append({
                     "name": t["name"],
                     "language": t.get("language", "en_US"),
@@ -131,6 +140,7 @@ async def get_message_templates() -> list[dict]:
                     "body": body_text,
                     "parameter_count": len(params),
                 })
+            _template_cache_loaded = True
             return templates
         else:
             logger.error(f"Failed to fetch templates ({response.status_code}): {response.text}")
@@ -140,10 +150,17 @@ async def get_message_templates() -> list[dict]:
         return []
 
 
+async def _get_template_body(template_name: str) -> str | None:
+    """Get the body text for a template, loading from Meta API if needed."""
+    if not _template_cache_loaded:
+        await get_message_templates()
+    return _template_body_cache.get(template_name)
+
+
 async def send_template_message(
     phone_number: str,
     template_name: str,
-    language_code: str = "en_US",
+    language_code: str = "en_GB",
     parameters: list[str] | None = None,
     conversation_id: str | None = None,
     lead_id: str | None = None,
@@ -182,10 +199,21 @@ async def send_template_message(
             wa_message_id = resp_data.get("messages", [{}])[0].get("id", "")
             internal_id = str(uuid.uuid4())
 
-            # Build a readable content string for DB storage
-            content = f"[Template: {template_name}]"
-            if parameters:
-                content += f"\n{', '.join(str(p) for p in parameters)}"
+            # Build the actual message content for DB storage
+            template_body = await _get_template_body(template_name)
+            if template_body and parameters:
+                # Replace {{1}}, {{2}}, etc. with actual parameter values
+                import re
+                content = template_body
+                for i, param_val in enumerate(parameters, start=1):
+                    content = content.replace(f"{{{{{i}}}}}", param_val)
+            elif template_body:
+                content = template_body
+            else:
+                # Fallback if template body couldn't be fetched
+                content = f"[Template: {template_name}]"
+                if parameters:
+                    content += f"\n{', '.join(str(p) for p in parameters)}"
 
             if conversation_id and lead_id:
                 await _save_outgoing_message(

@@ -62,7 +62,7 @@ class ManualTriggerRequest(BaseModel):
 
 class TemplateSendRequest(BaseModel):
     template_name: str
-    language_code: str = "en_US"
+    language_code: str = "en_GB"
     parameters: list[str] | None = None
     member_phones: list[str]  # list of phones, or ["all"] to send to everyone
 
@@ -238,7 +238,8 @@ async def trigger_manual_followup(body: ManualTriggerRequest):
             if not member:
                 raise HTTPException(status_code=404, detail="Member not found")
 
-            member_name = member["member_name"] or "there"
+            full_name = member["member_name"] or "there"
+            member_name = full_name.split()[0] if full_name != "there" else "there"
 
             # Use provided message or fall back to config
             if body.message:
@@ -354,12 +355,14 @@ async def send_template_to_members(body: TemplateSendRequest):
 
             for row in rows:
                 phone = row["member_phone"]
-                # Replace {member_name} in parameters if present
-                member_name = row["member_name"] or "there"
+                # Replace {member_name} in parameters with first name
+                full_name = row["member_name"] or "there"
+                first_name = full_name.split()[0] if full_name != "there" else "there"
                 params = None
                 if body.parameters:
                     params = [
-                        p.replace("{member_name}", member_name)
+                        p.replace("{member_name}", first_name)
+                         .replace("{first_name}", first_name)
                         for p in body.parameters
                     ]
 

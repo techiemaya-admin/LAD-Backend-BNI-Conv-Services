@@ -127,8 +127,9 @@ async def send_icp_followups():
                     )
                     continue
 
-                # Build the message
-                member_name = member["member_name"] or "there"
+                # Build the message — use first name only
+                full_name = member["member_name"] or "there"
+                member_name = full_name.split()[0] if full_name != "there" else "there"
                 message_type = config.get("message_type", "template")
 
                 if message_type == "custom" and config.get("custom_message"):

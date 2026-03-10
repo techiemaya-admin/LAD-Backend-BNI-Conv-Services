@@ -40,7 +40,7 @@ class BulkDeleteRequest(BaseModel):
 class BulkTemplateSendRequest(BaseModel):
     conversation_ids: list[str]
     template_name: str
-    language_code: str = "en_US"
+    language_code: str = "en_GB"
     parameters: list[str] | None = None
 
 
@@ -296,12 +296,14 @@ async def bulk_send_template(body: BulkTemplateSendRequest):
     """Send a WhatsApp template message to multiple conversations."""
     try:
         async with ClientDBConnection() as conn:
-            # Resolve phone numbers for all conversation IDs
+            # Resolve phone numbers and member names for all conversation IDs
             rows = await conn.fetch(
                 """
-                SELECT c.id AS conversation_id, c.lead_id, l.phone, l.name
+                SELECT c.id AS conversation_id, c.lead_id, l.phone,
+                       COALESCE(bcm.member_name, l.name) AS name
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN bni_conversation_manager bcm ON bcm.lead_id = c.lead_id
                 WHERE c.id = ANY($1::uuid[])
                 """,
                 body.conversation_ids,
@@ -318,12 +320,13 @@ async def bulk_send_template(body: BulkTemplateSendRequest):
             # Substitute {member_name} / {member-name} in parameters if present
             params = None
             if body.parameters:
-                member_name = r["name"] or "there"
+                full_name = r["name"] or "there"
+                first_name = full_name.split()[0] if full_name != "there" else "there"
                 params = [
-                    p.replace("{member_name}", member_name)
-                     .replace("{member-name}", member_name)
-                     .replace("{first_name}", member_name.split()[0] if member_name != "there" else "there")
-                     .replace("{first-name}", member_name.split()[0] if member_name != "there" else "there")
+                    p.replace("{member_name}", first_name)
+                     .replace("{member-name}", first_name)
+                     .replace("{first_name}", first_name)
+                     .replace("{first-name}", first_name)
                     for p in body.parameters
                 ]
 
