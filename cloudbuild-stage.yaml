@@ -41,7 +41,7 @@ steps:
       - '--max-instances=10'
       - '--concurrency=50'
       - '--timeout=300'
-      - '--set-env-vars=ENVIRONMENT=staging'
+      - '--set-env-vars=BNI_DB_URL=${_BNI_DB_URL},AGENT_DB_URL=${_AGENT_DB_URL},BNI_TENANT_ID=${_BNI_TENANT_ID},ENVIRONMENT=staging'
     id: 'deploy'
 
 # Build configuration
@@ -64,6 +64,13 @@ substitutions:
   _REGION: 'us-central1'
   _SERVICE_NAME: 'bni-conversation-service-stage'
 
+# Substitutions (environment variables for deployment)
+substitutions:
+  _BNI_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_bni'
+  _AGENT_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent'
+  _BNI_TENANT_ID: '9ca4012a-2e02-5593-8cc1-fd5bd81483f9'
+
 # Trigger configuration (applied in Cloud Console)
 # Trigger on: Push to stage branch
 # Branch: ^stage$
+# Note: For production, migrate credentials to Google Secret Manager instead of hardcoding
