@@ -156,16 +156,40 @@ async def process_conversation(
     logger.info(f"[{slug}][TIMING] get_messages+load_prompt (parallel): {_time.time()-t0:.3f}s")
 
     try:
-        system_prompt = prompt_template.format(
-            conversation_json=conversation_json,
-            context_json=context_json,
+        # Use string.Formatter to safely replace placeholders while preserving
+        # invalid format specifiers in the template
+        import string
+        
+        class SafeFormatter(string.Formatter):
+            def get_field(self, field_name, args, kwargs):
+                if field_name in kwargs:
+                    return kwargs[field_name], field_name
+                # Return the whole placeholder unchanged if not found
+                return f"{{{field_name}}}", field_name
+            
+            def format_field(self, value, format_spec):
+                # If the value is a placeholder, return it as-is
+                if isinstance(value, str) and value.startswith('{'):
+                    return value
+                try:
+                    return super().format_field(value, format_spec)
+                except (ValueError, KeyError):
+                    # Return placeholder with format spec if formatting fails
+                    return f"{{{value}:{format_spec}}}"
+        
+        formatter = SafeFormatter()
+        format_args = {
+            'conversation_json': conversation_json,
+            'context_json': context_json,
             # Backward compat: BNI prompts may still use these
-            member_json=context_json,
-            match_json=json.dumps(metadata.get("match_json", {})),
-            meeting_json=json.dumps(metadata.get("meeting_json", {})),
-            stats_json=json.dumps(metadata.get("stats_json", {})),
-            current_date=datetime.utcnow().strftime("%Y-%m-%d"),
-        )
+            'member_json': context_json,
+            'match_json': json.dumps(metadata.get("match_json", {})),
+            'meeting_json': json.dumps(metadata.get("meeting_json", {})),
+            'stats_json': json.dumps(metadata.get("stats_json", {})),
+            'current_date': datetime.utcnow().strftime("%Y-%m-%d"),
+            'agent_reply': '',  # Legacy placeholder
+        }
+        system_prompt = formatter.vformat(prompt_template, (), format_args)
     except Exception as e:
         logger.error(f"Prompt formatting failed: {e}", exc_info=True)
         return "I'm sorry, I'm having trouble processing your message. Please try again."
