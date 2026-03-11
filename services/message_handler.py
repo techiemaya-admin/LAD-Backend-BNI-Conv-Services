@@ -163,6 +163,27 @@ async def _save_incoming_message(
         )
 
 
+async def _save_outgoing_message(
+    conversation_id: str, lead_id: str, content: str,
+    chapter: WhatsAppAccount,
+):
+    """Save outgoing agent message to DB."""
+    msg_id = str(uuid.uuid4())
+    async with AsyncDBConnection(chapter.tenant_id) as conn:
+        await conn.execute(
+            """
+            INSERT INTO messages (id, conversation_id, lead_id, role, content,
+                message_status, tenant_id, created_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'agent', $4, 'sent', $5::uuid, NOW())
+            """,
+            msg_id,
+            conversation_id,
+            lead_id,
+            content,
+            chapter.tenant_id,
+        )
+
+
 async def _update_conversation_timestamp(conv_id: str, chapter: WhatsAppAccount):
     """Update conversation's last activity timestamp."""
     async with AsyncDBConnection(chapter.tenant_id) as conn:
@@ -290,6 +311,14 @@ async def _flush_buffer(
             logger.info(
                 f"[{chapter.slug}] AI Reply ready ({len(reply)} chars): {reply[:100]}...",
                 extra={"phone_number": phone_number}
+            )
+            
+            # Save agent response to database
+            await _save_outgoing_message(
+                conversation_id=conv_id,
+                lead_id=lead_id,
+                content=reply,
+                chapter=chapter,
             )
             
             t_wa = time.time()
