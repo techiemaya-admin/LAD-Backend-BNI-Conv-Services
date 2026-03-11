@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Followup settings API — manage ICP followup configuration and view status.
 
@@ -10,11 +11,13 @@ Endpoints:
 import json
 import logging
 from datetime import datetime, timedelta
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 from services import whatsapp_client
 
 logger = logging.getLogger(__name__)
@@ -109,10 +112,10 @@ async def _get_config(conn) -> dict:
 # ── Endpoints ─────────────────────────────────────────────────────
 
 @router.get("")
-async def get_followup_config():
+async def get_followup_config(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Return current ICP followup configuration."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             config = await _get_config(conn)
             return {"success": True, "data": config}
     except Exception as e:
@@ -121,10 +124,13 @@ async def get_followup_config():
 
 
 @router.put("")
-async def update_followup_config(body: FollowupConfigUpdate):
+async def update_followup_config(
+    body: FollowupConfigUpdate,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update ICP followup configuration (partial update)."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             current = await _get_config(conn)
 
             # Merge only provided fields
@@ -147,27 +153,27 @@ async def update_followup_config(body: FollowupConfigUpdate):
 
 
 @router.get("/status")
-async def get_followup_status():
+async def get_followup_status(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Get stats on idle members eligible for ICP followup."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             config = await _get_config(conn)
             idle_hours = config.get("idle_hours", 23)
             max_attempts = config.get("max_attempts", 3)
             cutoff = datetime.utcnow() - timedelta(hours=idle_hours)
 
-            # Get all incomplete ICP members
+            # Get all incomplete ICP members from conversation_states
             members = await conn.fetch(
                 """
                 SELECT
-                    bcm.member_phone,
-                    bcm.member_name,
-                    bcm.context_status,
-                    bcm.metadata,
-                    bcm.updated_at
-                FROM bni_conversation_manager bcm
-                WHERE bcm.context_status = ANY($1::text[])
-                ORDER BY bcm.updated_at DESC
+                    cs.phone,
+                    cs.contact_name,
+                    cs.context_status,
+                    cs.metadata,
+                    cs.updated_at
+                FROM conversation_states cs
+                WHERE cs.context_status = ANY($1::text[])
+                ORDER BY cs.updated_at DESC
                 """,
                 list(INCOMPLETE_ICP_STATUSES),
             )
@@ -186,8 +192,8 @@ async def get_followup_status():
                 is_idle = m["updated_at"] < cutoff if m["updated_at"] else False
 
                 idle_members.append({
-                    "member_phone": m["member_phone"],
-                    "member_name": m["member_name"],
+                    "member_phone": m["phone"],
+                    "member_name": m["contact_name"],
                     "context_status": m["context_status"],
                     "last_activity": m["updated_at"].isoformat() if m["updated_at"] else None,
                     "idle": is_idle,
@@ -214,22 +220,25 @@ async def get_followup_status():
 
 
 @router.post("/trigger")
-async def trigger_manual_followup(body: ManualTriggerRequest):
+async def trigger_manual_followup(
+    body: ManualTriggerRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Manually send a followup message to a specific member."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             config = await _get_config(conn)
 
             member = await conn.fetchrow(
                 """
-                SELECT bcm.id, bcm.member_phone, bcm.member_name,
-                       bcm.context_status, bcm.metadata,
+                SELECT cs.id, cs.phone, cs.contact_name,
+                       cs.context_status, cs.metadata,
                        c.id AS conversation_id, l.id AS lead_id
-                FROM bni_conversation_manager bcm
-                LEFT JOIN leads l ON l.phone = bcm.member_phone
+                FROM conversation_states cs
+                LEFT JOIN leads l ON l.phone = cs.phone
                 LEFT JOIN conversations c
                     ON c.lead_id = l.id AND c.status = 'active'
-                WHERE bcm.member_phone = $1
+                WHERE cs.phone = $1
                 LIMIT 1
                 """,
                 body.member_phone,
@@ -238,7 +247,7 @@ async def trigger_manual_followup(body: ManualTriggerRequest):
             if not member:
                 raise HTTPException(status_code=404, detail="Member not found")
 
-            full_name = member["member_name"] or "there"
+            full_name = member["contact_name"] or "there"
             member_name = full_name.split()[0] if full_name != "there" else "there"
 
             # Use provided message or fall back to config
@@ -276,7 +285,7 @@ async def trigger_manual_followup(body: ManualTriggerRequest):
 
             await conn.execute(
                 """
-                UPDATE bni_conversation_manager
+                UPDATE conversation_states
                 SET metadata = $1::jsonb, updated_at = NOW()
                 WHERE id = $2::uuid
                 """,
@@ -312,10 +321,13 @@ async def list_whatsapp_templates():
 
 
 @router.post("/send-template")
-async def send_template_to_members(body: TemplateSendRequest):
+async def send_template_to_members(
+    body: TemplateSendRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Send a WhatsApp template message to selected members (or all idle members)."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             # Resolve target members
             if body.member_phones == ["all"]:
                 config = await _get_config(conn)
@@ -324,14 +336,14 @@ async def send_template_to_members(body: TemplateSendRequest):
 
                 rows = await conn.fetch(
                     """
-                    SELECT bcm.member_phone, bcm.member_name,
+                    SELECT cs.phone AS member_phone, cs.contact_name AS member_name,
                            c.id AS conversation_id, l.id AS lead_id
-                    FROM bni_conversation_manager bcm
-                    LEFT JOIN leads l ON l.phone = bcm.member_phone
+                    FROM conversation_states cs
+                    LEFT JOIN leads l ON l.phone = cs.phone
                     LEFT JOIN conversations c
                         ON c.lead_id = l.id AND c.status = 'active'
-                    WHERE bcm.context_status = ANY($1::text[])
-                      AND bcm.updated_at < $2
+                    WHERE cs.context_status = ANY($1::text[])
+                      AND cs.updated_at < $2
                     """,
                     list(INCOMPLETE_ICP_STATUSES),
                     cutoff,
@@ -339,13 +351,13 @@ async def send_template_to_members(body: TemplateSendRequest):
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT bcm.member_phone, bcm.member_name,
+                    SELECT cs.phone AS member_phone, cs.contact_name AS member_name,
                            c.id AS conversation_id, l.id AS lead_id
-                    FROM bni_conversation_manager bcm
-                    LEFT JOIN leads l ON l.phone = bcm.member_phone
+                    FROM conversation_states cs
+                    LEFT JOIN leads l ON l.phone = cs.phone
                     LEFT JOIN conversations c
                         ON c.lead_id = l.id AND c.status = 'active'
-                    WHERE bcm.member_phone = ANY($1::text[])
+                    WHERE cs.phone = ANY($1::text[])
                     """,
                     body.member_phones,
                 )

@@ -1,24 +1,85 @@
 """
-WhatsApp webhook endpoint.
+WhatsApp webhook endpoints.
 
-GET  /webhook — Facebook verification handshake
-POST /webhook — Receive incoming WhatsApp messages
+Supports multi-tenant account routing:
+  GET  /webhook/{slug} — Facebook verification handshake (per-account token)
+  POST /webhook/{slug} — Receive incoming WhatsApp messages for an account
+
+Backward-compatible:
+  GET  /webhook — uses default account
+  POST /webhook — uses default account
 """
+from __future__ import annotations
+
 import logging
 import os
 
-from fastapi import APIRouter, Request, BackgroundTasks, Query
+from fastapi import APIRouter, Request, BackgroundTasks, Query, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 from services.message_handler import handle_incoming_message
-from db.connection import ClientDBConnection
+from services.account_registry import (
+    get_account_by_slug,
+    get_default_account,
+    WhatsAppAccount,
+)
+from db.connection import AsyncDBConnection
 
 logger = logging.getLogger(__name__)
 
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "BNI_Rising_Phoenix_2026")
+# Fallback verify token for backward compat
+_FALLBACK_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "BNI_Rising_Phoenix_2026")
 
 router = APIRouter(tags=["webhook"])
 
+
+# ====================
+# Multi-tenant webhook (primary)
+# ====================
+
+@router.get("/webhook/{chapter_slug}")
+async def verify_chapter_webhook(
+    chapter_slug: str,
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+):
+    """Facebook webhook verification for a specific chapter."""
+    chapter = get_account_by_slug(chapter_slug)
+    if not chapter:
+        raise HTTPException(404, f"Chapter '{chapter_slug}' not found")
+
+    if hub_mode == "subscribe" and hub_verify_token == chapter.whatsapp_verify_token:
+        logger.info(f"Webhook verified for chapter: {chapter_slug}")
+        return PlainTextResponse(content=hub_challenge)
+
+    logger.warning(f"Webhook verification failed for chapter: {chapter_slug}")
+    return PlainTextResponse(content="Verification failed", status_code=403)
+
+
+@router.post("/webhook/{chapter_slug}")
+async def receive_chapter_webhook(
+    chapter_slug: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """Receive incoming WhatsApp messages for a specific chapter."""
+    chapter = get_account_by_slug(chapter_slug)
+    if not chapter:
+        raise HTTPException(404, f"Chapter '{chapter_slug}' not found")
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"status": "invalid payload"}, status_code=400)
+
+    background_tasks.add_task(process_webhook_payload, data, chapter)
+    return JSONResponse({"status": "accepted"})
+
+
+# ====================
+# Backward-compatible webhook (defaults to first chapter)
+# ====================
 
 @router.get("/webhook")
 async def verify_webhook(
@@ -26,31 +87,42 @@ async def verify_webhook(
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
-    """Facebook webhook verification handshake."""
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        logger.info("Webhook verified successfully")
+    """Facebook webhook verification (backward compat — uses default chapter)."""
+    # Try default chapter token first, then env var fallback
+    chapter = get_default_account()
+    verify_token = chapter.whatsapp_verify_token if chapter else _FALLBACK_VERIFY_TOKEN
+
+    if hub_mode == "subscribe" and hub_verify_token == verify_token:
+        logger.info("Webhook verified (default chapter)")
         return PlainTextResponse(content=hub_challenge)
 
-    logger.warning(f"Webhook verification failed: mode={hub_mode}")
+    logger.warning("Webhook verification failed (default chapter)")
     return PlainTextResponse(content="Verification failed", status_code=403)
 
 
 @router.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receive incoming WhatsApp messages. Returns 200 immediately, processes in background."""
+    """Receive incoming WhatsApp messages (backward compat — uses default chapter)."""
+    chapter = get_default_account()
+    if not chapter:
+        logger.error("No default chapter configured")
+        return JSONResponse({"status": "no chapter configured"}, status_code=500)
+
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
 
-    # Return 200 immediately (Facebook requires < 5s response)
-    # Process message in background
-    background_tasks.add_task(process_webhook_payload, data)
+    background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 
 
-async def process_webhook_payload(data: dict):
-    """Background processing of webhook payload."""
+# ====================
+# Shared Processing
+# ====================
+
+async def process_webhook_payload(data: dict, chapter: WhatsAppAccount):
+    """Background processing of webhook payload for a specific chapter."""
     try:
         if data.get("object") != "whatsapp_business_account":
             return
@@ -62,7 +134,7 @@ async def process_webhook_payload(data: dict):
                 # Handle delivery status updates
                 if "statuses" in value:
                     for status in value["statuses"]:
-                        await _update_message_status(status)
+                        await _update_message_status(status, chapter)
 
                 # Handle incoming messages
                 if "messages" in value:
@@ -87,26 +159,22 @@ async def process_webhook_payload(data: dict):
                                 message_text=message_text,
                                 contact_name=contact_name,
                                 external_message_id=external_message_id,
+                                chapter=chapter,
                             )
 
     except Exception as e:
-        logger.error(f"Error processing webhook payload: {e}", exc_info=True)
+        logger.error(f"Error processing webhook payload for {chapter.slug}: {e}", exc_info=True)
 
 
-async def _update_message_status(status: dict):
-    """Update message delivery status from WhatsApp status webhook.
-
-    WhatsApp sends: sent → delivered → read (each as a separate callback).
-    We map these to our message_status column.
-    """
+async def _update_message_status(status: dict, chapter: WhatsAppAccount):
+    """Update message delivery status from WhatsApp status webhook."""
     try:
         wa_message_id = status.get("id")
-        wa_status = status.get("status")  # sent, delivered, read, failed
+        wa_status = status.get("status")
 
         if not wa_message_id or not wa_status:
             return
 
-        # Map WhatsApp status to our DB status
         status_map = {
             "sent": "sent",
             "delivered": "delivered",
@@ -117,7 +185,7 @@ async def _update_message_status(status: dict):
         if not db_status:
             return
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(chapter.tenant_id) as conn:
             result = await conn.execute(
                 """
                 UPDATE messages SET message_status = $1
@@ -128,7 +196,7 @@ async def _update_message_status(status: dict):
                 wa_message_id,
             )
             if "UPDATE 1" in result:
-                logger.info(f"Message {wa_message_id} status → {db_status}")
+                logger.info(f"[{chapter.slug}] Message {wa_message_id} status → {db_status}")
 
     except Exception as e:
-        logger.error(f"Error updating message status: {e}")
+        logger.error(f"Error updating message status for {chapter.slug}: {e}")

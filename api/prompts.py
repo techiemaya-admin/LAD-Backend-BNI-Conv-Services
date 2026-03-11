@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Prompts & Chat Settings API — manage system prompts and chat configuration.
 
@@ -12,11 +13,13 @@ Endpoints:
 """
 import json
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -44,23 +47,6 @@ class ChatSettingsUpdate(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────
-
-async def _ensure_channel_column(conn):
-    """Add channel column to bni_prompts if it doesn't exist."""
-    await conn.execute(
-        """
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'bni_prompts' AND column_name = 'channel'
-            ) THEN
-                ALTER TABLE bni_prompts ADD COLUMN channel VARCHAR(20) DEFAULT 'whatsapp';
-            END IF;
-        END $$;
-        """
-    )
-
 
 DEFAULT_CHAT_SETTINGS = {
     "knowledge_base": "",
@@ -111,16 +97,15 @@ async def _get_chat_settings(conn) -> dict:
 # ── Prompts Endpoints ─────────────────────────────────────────────
 
 @router.get("/api/prompts")
-async def list_prompts():
+async def list_prompts(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """List all prompts."""
     try:
-        async with ClientDBConnection() as conn:
-            await _ensure_channel_column(conn)
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT name, prompt_text, version, is_active, channel,
                        created_at, updated_at
-                FROM bni_prompts
+                FROM prompts
                 ORDER BY name
                 """
             )
@@ -143,20 +128,24 @@ async def list_prompts():
 
 
 @router.post("/api/prompts")
-async def create_prompt(body: PromptCreate):
+async def create_prompt(
+    body: PromptCreate,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Create a new prompt."""
     try:
-        async with ClientDBConnection() as conn:
-            await _ensure_channel_column(conn)
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
-                INSERT INTO bni_prompts (name, prompt_text, version, is_active, channel, created_at, updated_at)
-                VALUES ($1, $2, 1, $3, $4, NOW(), NOW())
+                INSERT INTO prompts (name, prompt_text, version, is_active, channel,
+                                     tenant_id, created_at, updated_at)
+                VALUES ($1, $2, 1, $3, $4, $5::uuid, NOW(), NOW())
                 """,
                 body.name,
                 body.prompt_text,
                 body.is_active,
                 body.channel,
+                tenant_id,
             )
             return {"success": True, "data": {"name": body.name}}
     except Exception as e:
@@ -165,16 +154,18 @@ async def create_prompt(body: PromptCreate):
 
 
 @router.get("/api/prompts/{name}")
-async def get_prompt(name: str):
+async def get_prompt(
+    name: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Get a single prompt by name."""
     try:
-        async with ClientDBConnection() as conn:
-            await _ensure_channel_column(conn)
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 SELECT name, prompt_text, version, is_active, channel,
                        created_at, updated_at
-                FROM bni_prompts WHERE name = $1
+                FROM prompts WHERE name = $1
                 """,
                 name,
             )
@@ -200,14 +191,17 @@ async def get_prompt(name: str):
 
 
 @router.put("/api/prompts/{name}")
-async def update_prompt(name: str, body: PromptUpdate):
+async def update_prompt(
+    name: str,
+    body: PromptUpdate,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update a prompt's text, active status, or channel."""
     try:
-        async with ClientDBConnection() as conn:
-            await _ensure_channel_column(conn)
+        async with AsyncDBConnection(tenant_id) as conn:
             # Check exists
             existing = await conn.fetchrow(
-                "SELECT name FROM bni_prompts WHERE name = $1", name
+                "SELECT name FROM prompts WHERE name = $1", name
             )
             if not existing:
                 raise HTTPException(status_code=404, detail="Prompt not found")
@@ -240,7 +234,7 @@ async def update_prompt(name: str, body: PromptUpdate):
             set_clauses.append("updated_at = NOW()")
             params.append(name)
 
-            query = f"UPDATE bni_prompts SET {', '.join(set_clauses)} WHERE name = ${idx}"
+            query = f"UPDATE prompts SET {', '.join(set_clauses)} WHERE name = ${idx}"
             await conn.execute(query, *params)
 
             return {"success": True, "data": {"name": name}}
@@ -252,12 +246,15 @@ async def update_prompt(name: str, body: PromptUpdate):
 
 
 @router.delete("/api/prompts/{name}")
-async def delete_prompt(name: str):
+async def delete_prompt(
+    name: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Delete a prompt."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             result = await conn.execute(
-                "DELETE FROM bni_prompts WHERE name = $1", name
+                "DELETE FROM prompts WHERE name = $1", name
             )
             if result == "DELETE 0":
                 raise HTTPException(status_code=404, detail="Prompt not found")
@@ -272,10 +269,10 @@ async def delete_prompt(name: str):
 # ── Chat Settings Endpoints ──────────────────────────────────────
 
 @router.get("/api/chat-settings")
-async def get_chat_settings():
+async def get_chat_settings(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Get knowledge base and campaign frequency config."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             config = await _get_chat_settings(conn)
             return {"success": True, "data": config}
     except Exception as e:
@@ -284,10 +281,13 @@ async def get_chat_settings():
 
 
 @router.put("/api/chat-settings")
-async def update_chat_settings(body: ChatSettingsUpdate):
+async def update_chat_settings(
+    body: ChatSettingsUpdate,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update knowledge base and/or campaign frequency config."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             current = await _get_chat_settings(conn)
             updates = body.model_dump(exclude_none=True)
             current.update(updates)

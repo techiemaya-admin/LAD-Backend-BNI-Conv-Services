@@ -1,8 +1,12 @@
+from __future__ import annotations
 """
-Conversation engine — LLM pipeline and state machine.
+Conversation engine — generic LLM pipeline with pluggable flow templates.
 
-Loads conversation state → selects prompt → calls Gemini (primary) or OpenAI (fallback)
-→ parses response → upserts state.
+Loads conversation state -> selects prompt via flow template -> calls LLM
+-> parses response -> updates state -> runs flow-specific side effects.
+
+Supports any industry client through the flow template system.
+BNI-specific logic lives in modules/bni/ and is invoked via flow hooks.
 """
 import json
 import logging
@@ -16,35 +20,35 @@ import asyncio
 import google.generativeai as genai
 from openai import AsyncOpenAI
 
-from db.connection import ClientDBConnection, CoreDBConnection
-from db.schema import core_table, get_tenant_id
-from services.prompt_loader import get_prompt, get_prompt_name_for_status
+from db.connection import AsyncDBConnection, CoreDBConnection
+from services.account_registry import WhatsAppAccount
+from services.flow_registry import get_flow
+from services.prompt_loader import get_prompt
 
 logger = logging.getLogger(__name__)
 
-# Primary model (Gemini)
-GEMINI_MODEL = "gemini-2.5-flash"
-# Fallback model (OpenAI)
-OPENAI_MODEL = "gpt-4o-mini"
+# Fallback models (used when account doesn't specify)
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 # Expose for test script
-MODEL_NAME = GEMINI_MODEL
+MODEL_NAME = DEFAULT_GEMINI_MODEL
 
 _gemini_configured = False
 _openai_client: AsyncOpenAI | None = None
 
 
-def _ensure_gemini_configured():
+def _ensure_gemini_configured(api_key: str | None = None):
     """Lazily configure Gemini API key."""
     global _gemini_configured
     if not _gemini_configured:
-        api_key = os.getenv("GOOGLE_API_KEY", "")
-        if api_key:
-            genai.configure(api_key=api_key)
+        key = api_key or os.getenv("GOOGLE_API_KEY", "")
+        if key:
+            genai.configure(api_key=key)
             _gemini_configured = True
             logger.info("Gemini API configured successfully")
         else:
-            logger.warning("GOOGLE_API_KEY not set — Gemini unavailable, will use OpenAI fallback")
+            logger.warning("GOOGLE_API_KEY not set — Gemini unavailable")
 
 
 def _get_openai_client() -> AsyncOpenAI:
@@ -70,22 +74,46 @@ async def process_conversation(
     conversation_id: str,
     message_text: str,
     contact_name: str,
+    account: WhatsAppAccount | None = None,
 ) -> str | None:
-    """Main conversation processing pipeline. Returns the AI reply text."""
+    """Main conversation processing pipeline. Returns the AI reply text.
 
+    Works with any flow template — BNI, generic, or custom.
+    """
     t_pipeline = _time.time()
+
+    # Resolve account and flow
+    if account is None:
+        from services.account_registry import get_default_account
+        account = get_default_account()
+        if account is None:
+            logger.error("No account available for conversation processing")
+            return "I'm sorry, I'm having trouble processing your message. Please try again."
+
+    flow = get_flow(account.conversation_flow_template)
+    tenant_id = account.tenant_id
+    slug = account.slug
 
     # 1. Load or create conversation state
     t0 = _time.time()
-    state = await _load_conversation_state(phone_number)
+    state = await _load_conversation_state(phone_number, tenant_id)
 
     if state is None:
-        state = await _create_conversation_state(phone_number, lead_id, contact_name)
-    logger.info(f"[TIMING] load_conversation_state: {_time.time()-t0:.3f}s")
+        state = await _create_conversation_state(
+            phone_number, lead_id, contact_name, account, flow
+        )
+    logger.info(f"[{slug}][TIMING] load_conversation_state: {_time.time()-t0:.3f}s")
 
-    context_status = state.get("context_status", "onboarding_greeting")
+    context_status = state.get("context_status", flow.initial_status)
 
     # 2. Build context for the prompt
+    profile_data = state.get("profile_data", {})
+    if isinstance(profile_data, str):
+        try:
+            profile_data = json.loads(profile_data)
+        except Exception:
+            profile_data = {}
+
     metadata = state.get("metadata", {})
     if isinstance(metadata, str):
         try:
@@ -93,115 +121,130 @@ async def process_conversation(
         except Exception:
             metadata = {}
 
-    member_info = {
-        "name": state.get("member_name", contact_name),
-        "company_name": state.get("company_name"),
-        "industry": state.get("industry"),
-        "designation": state.get("designation"),
-        "services_offered": state.get("services_offered"),
-        "ideal_customer_profile": state.get("ideal_customer_profile"),
+    # Build context_json — a single JSON blob with all state data
+    context_info = {
+        "name": state.get("contact_name", contact_name),
         "phone": phone_number,
+        "context_status": context_status,
     }
+    # Merge profile_data fields into context
+    context_info.update(profile_data)
+    # Include metadata fields that prompts might need
+    for key in ["match_json", "meeting_json", "stats_json", "icp_step", "icp_answers", "website_data"]:
+        if key in metadata:
+            context_info[key] = metadata[key]
 
-    if context_status == "icp_discovery":
-        member_info["icp_step"] = metadata.get("icp_step", 1)
-        member_info["icp_answers"] = metadata.get("icp_answers", {})
-        website_data = metadata.get("website_data")
-        if website_data:
-            member_info["website_data"] = website_data
-
-    member_json = json.dumps(member_info, indent=2)
+    context_json = json.dumps(context_info, indent=2)
 
     # Load recent messages + prompt IN PARALLEL
     t0 = _time.time()
-    prompt_name = get_prompt_name_for_status(context_status)
-    logger.info(f"Loading prompt '{prompt_name}' for status '{context_status}'")
+    prompt_name = flow.get_prompt_name(context_status)
+    logger.info(f"[{slug}] Loading prompt '{prompt_name}' for status '{context_status}'")
     conversation_json, prompt_template = await asyncio.gather(
-        _get_recent_messages(conversation_id, limit=10),
-        get_prompt(prompt_name),
+        _get_recent_messages(conversation_id, tenant_id, limit=10),
+        get_prompt(prompt_name, account),
     )
-    logger.info(f"[TIMING] get_messages+load_prompt (parallel): {_time.time()-t0:.3f}s")
+    logger.info(f"[{slug}][TIMING] get_messages+load_prompt (parallel): {_time.time()-t0:.3f}s")
 
     try:
         system_prompt = prompt_template.format(
             conversation_json=conversation_json,
-            member_json=member_json,
-            match_json=metadata.get("match_json", "{}"),
-            meeting_json=metadata.get("meeting_json", "{}"),
-            stats_json=metadata.get("stats_json", "{}"),
+            context_json=context_json,
+            # Backward compat: BNI prompts may still use these
+            member_json=context_json,
+            match_json=json.dumps(metadata.get("match_json", {})),
+            meeting_json=json.dumps(metadata.get("meeting_json", {})),
+            stats_json=json.dumps(metadata.get("stats_json", {})),
             current_date=datetime.utcnow().strftime("%Y-%m-%d"),
         )
     except Exception as e:
         logger.error(f"Prompt formatting failed: {e}", exc_info=True)
         return "I'm sorry, I'm having trouble processing your message. Please try again."
 
-    # 4. Call LLM — try Gemini first, fall back to OpenAI
+    # 4. Call LLM — use account's model preference
     t0 = _time.time()
-    llm_response = await _call_gemini(system_prompt, message_text, phone_number)
+    gemini_model = account.ai_model if "gemini" in (account.ai_model or "").lower() else DEFAULT_GEMINI_MODEL
+    openai_model = account.ai_model if "gpt" in (account.ai_model or "").lower() else DEFAULT_OPENAI_MODEL
+
+    llm_response = await _call_gemini(
+        system_prompt, message_text, phone_number,
+        model=gemini_model, api_key=account.ai_api_key,
+    )
 
     if llm_response:
-        logger.info(f"[TIMING] gemini_api_call: {_time.time()-t0:.3f}s")
+        logger.info(f"[{slug}][TIMING] gemini_api_call: {_time.time()-t0:.3f}s")
     else:
-        logger.warning("Gemini failed, falling back to OpenAI")
+        logger.warning(f"[{slug}] Gemini failed, falling back to OpenAI")
         t0 = _time.time()
-        llm_response = await _call_openai(system_prompt, message_text, phone_number)
-        logger.info(f"[TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s")
+        llm_response = await _call_openai(
+            system_prompt, message_text, phone_number, model=openai_model
+        )
+        logger.info(f"[{slug}][TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s")
 
     if not llm_response:
+        logger.error(f"[{slug}] LLM failed to generate response for {phone_number}")
         return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     # 5. Parse response
     agent_reply, info_fields = _parse_llm_response(llm_response)
 
     if not agent_reply:
-        return "I'm sorry, I couldn't understand that. Could you rephrase?"
+        logger.error(
+            f"[{slug}] LLM returned empty agent_reply for {phone_number}. "
+            f"Context status: {context_status}, Raw response: {llm_response[:200]}"
+        )
+        # Fall back to acknowledging the message
+        return f"Thank you for your message. I'm processing your information."
 
     # 6. Update conversation state
     t0 = _time.time()
     new_status = info_fields.get("context_status", context_status)
-    await _update_conversation_state(phone_number, lead_id, info_fields, new_status)
-    logger.info(f"[TIMING] update_conversation_state: {_time.time()-t0:.3f}s")
+    await _update_conversation_state(phone_number, tenant_id, info_fields, new_status, flow)
+    logger.info(f"[{slug}][TIMING] update_conversation_state: {_time.time()-t0:.3f}s")
 
-    # 7. Handle side effects based on state transitions
+    # 7. Handle side effects via flow template hook
     t0 = _time.time()
-    overridden_status = await _handle_state_transition(
-        phone_number, lead_id, conversation_id, context_status, new_status, info_fields
-    )
-    logger.info(f"[TIMING] handle_state_transition: {_time.time()-t0:.3f}s")
+    overridden_status = None
+    if flow.state_transition_handler:
+        overridden_status = await flow.state_transition_handler(
+            account, phone_number, lead_id, conversation_id,
+            context_status, new_status, info_fields,
+        )
+    logger.info(f"[{slug}][TIMING] handle_state_transition: {_time.time()-t0:.3f}s")
 
-    # 8. If state was overridden (e.g. onboarding_complete → match_suggested),
-    #    chain another LLM call so the user gets the next phase immediately.
+    # 8. If state was overridden, chain another LLM call
     if overridden_status and overridden_status != new_status:
-        logger.info(f"State overridden: {new_status} → {overridden_status}, chaining LLM call")
+        logger.info(f"[{slug}] State overridden: {new_status} -> {overridden_status}, chaining LLM call")
         chained_reply = await _chain_next_phase(
-            phone_number, lead_id, conversation_id, overridden_status, agent_reply
+            phone_number, lead_id, conversation_id, overridden_status, agent_reply, account
         )
         if chained_reply:
             agent_reply = f"{agent_reply}\n\n{chained_reply}"
 
-    logger.info(f"[TIMING] process_conversation TOTAL: {_time.time()-t_pipeline:.3f}s")
+    logger.info(f"[{slug}][TIMING] process_conversation TOTAL: {_time.time()-t_pipeline:.3f}s")
     return agent_reply
 
 
 # ---------------------------------------------------------------------------
-# Database helpers
+# Database helpers (generic — work with conversation_states table)
 # ---------------------------------------------------------------------------
 
-async def _load_conversation_state(phone_number: str) -> dict | None:
-    """Load conversation state from bni_conversation_manager."""
+async def _load_conversation_state(phone_number: str, tenant_id: str) -> dict | None:
+    """Load conversation state from conversation_states table."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM bni_conversation_manager WHERE member_phone = $1",
+                "SELECT * FROM conversation_states WHERE phone = $1",
                 phone_number,
             )
             if row:
                 result = dict(row)
-                if isinstance(result.get("metadata"), str):
-                    try:
-                        result["metadata"] = json.loads(result["metadata"])
-                    except Exception:
-                        result["metadata"] = {}
+                for field in ("profile_data", "metadata"):
+                    if isinstance(result.get(field), str):
+                        try:
+                            result[field] = json.loads(result[field])
+                        except Exception:
+                            result[field] = {}
                 return result
             return None
     except Exception as e:
@@ -210,91 +253,51 @@ async def _load_conversation_state(phone_number: str) -> dict | None:
 
 
 async def _create_conversation_state(
-    phone_number: str, lead_id: str, contact_name: str
+    phone_number: str, lead_id: str, contact_name: str,
+    account: WhatsAppAccount, flow,
 ) -> dict:
-    """Create initial conversation state for a new member.
+    """Create initial conversation state for a new contact.
 
-    Looks up existing member data in community_roi_members first.
-    If profile fields (company, industry) already exist, skip straight
-    to icp_discovery instead of onboarding_greeting.
+    If the flow has a create_state_handler (e.g., BNI looks up existing members),
+    it's called first to determine initial status and profile data.
     """
     state_id = str(uuid.uuid4())
+    tenant_id = account.tenant_id
 
-    # Check if member already exists in community_roi_members
-    member_name = contact_name
-    company_name = None
-    industry = None
-    designation = None
-    services_offered = None
-    initial_status = "onboarding_greeting"
+    initial_status = flow.initial_status
+    profile_data = {}
+    resolved_name = contact_name
 
-    try:
-        async with CoreDBConnection() as conn:
-            existing = await conn.fetchrow(
-                f"""
-                SELECT name, company_name, industry, designation, metadata
-                FROM {core_table('community_roi_members')}
-                WHERE REPLACE(REPLACE(REPLACE(phone, ' ', ''), '+', ''), '-', '') = $1
-                  AND tenant_id = $2::uuid AND is_deleted = false
-                """,
-                phone_number,
-                get_tenant_id(),
+    # Let the flow customize state creation
+    if flow.create_state_handler:
+        try:
+            custom_state = await flow.create_state_handler(
+                account, phone_number, lead_id, contact_name
             )
-            if existing:
-                # Use member's real name (strip chapter suffix if present)
-                raw_name = existing["name"] or contact_name
-                if "(" in raw_name:
-                    raw_name = raw_name[:raw_name.index("(")].strip()
-                member_name = raw_name
-                company_name = existing["company_name"]
-                industry = existing["industry"]
-                designation = existing["designation"]
-
-                ex_meta = existing["metadata"]
-                if isinstance(ex_meta, str):
-                    try:
-                        ex_meta = json.loads(ex_meta)
-                    except Exception:
-                        ex_meta = {}
-                services_offered = ex_meta.get("services_offered")
-
-                # If core profile fields exist, skip to ICP discovery
-                if company_name and industry:
-                    initial_status = "icp_discovery"
-                    logger.info(
-                        f"Existing member found for {phone_number}: {member_name} "
-                        f"({company_name}). Skipping to icp_discovery."
-                    )
-                else:
-                    # Some fields missing — start from onboarding_profile
-                    initial_status = "onboarding_profile"
-                    logger.info(
-                        f"Existing member found for {phone_number}: {member_name} "
-                        f"but profile incomplete. Starting onboarding_profile."
-                    )
-    except Exception as e:
-        logger.warning(f"Could not look up existing member for {phone_number}: {e}")
+            if custom_state:
+                resolved_name = custom_state.get("contact_name", contact_name)
+                initial_status = custom_state.get("context_status", initial_status)
+                profile_data = custom_state.get("profile_data", {})
+        except Exception as e:
+            logger.warning(f"Flow create_state_handler failed: {e}")
 
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
-                INSERT INTO bni_conversation_manager
-                    (id, lead_id, member_phone, member_name, context_status,
-                     company_name, industry, designation, services_offered,
-                     metadata, created_at, updated_at)
-                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, '{}', NOW(), NOW())
-                ON CONFLICT (member_phone) DO NOTHING
+                INSERT INTO conversation_states
+                    (id, lead_id, phone, contact_name, context_status,
+                     profile_data, metadata, tenant_id, created_at, updated_at)
+                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb, '{}', $7::uuid, NOW(), NOW())
+                ON CONFLICT (phone) DO NOTHING
                 """,
                 state_id,
                 lead_id,
                 phone_number,
-                member_name,
+                resolved_name,
                 initial_status,
-                company_name,
-                industry,
-                designation,
-                services_offered,
+                json.dumps(profile_data),
+                tenant_id,
             )
     except Exception as e:
         logger.error(f"Error creating conversation state: {e}")
@@ -302,58 +305,66 @@ async def _create_conversation_state(
     return {
         "id": state_id,
         "lead_id": lead_id,
-        "member_phone": phone_number,
-        "member_name": member_name,
+        "phone": phone_number,
+        "contact_name": resolved_name,
         "context_status": initial_status,
-        "company_name": company_name,
-        "industry": industry,
-        "designation": designation,
-        "services_offered": services_offered,
+        "profile_data": profile_data,
         "metadata": {},
     }
 
 
 async def _update_conversation_state(
-    phone_number: str, lead_id: str, info_fields: dict, new_status: str
+    phone_number: str, tenant_id: str, info_fields: dict, new_status: str, flow,
 ):
     """Update conversation state from LLM response fields."""
     try:
-        async with ClientDBConnection() as conn:
-            await conn.execute(
-                """
-                UPDATE bni_conversation_manager SET
-                    context_status = $1,
-                    company_name = COALESCE($2, company_name),
-                    industry = COALESCE($3, industry),
-                    designation = COALESCE($4, designation),
-                    services_offered = COALESCE($5, services_offered),
-                    ideal_customer_profile = COALESCE($6, ideal_customer_profile),
-                    updated_at = NOW()
-                WHERE member_phone = $7
-                """,
-                new_status,
-                info_fields.get("company_name"),
-                info_fields.get("industry"),
-                info_fields.get("designation"),
-                info_fields.get("services_offered"),
-                info_fields.get("ideal_customer_profile"),
-                phone_number,
-            )
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Update profile_data with any fields the flow defines
+            profile_updates = {}
+            for field_name in flow.profile_fields:
+                val = info_fields.get(field_name)
+                if val is not None:
+                    profile_updates[field_name] = val
 
-            icp_step = info_fields.get("icp_step")
-            icp_answers = info_fields.get("icp_answers")
-            if icp_step is not None or icp_answers is not None:
-                metadata_updates = {}
-                if icp_step is not None:
-                    metadata_updates["icp_step"] = icp_step
-                if icp_answers is not None:
-                    metadata_updates["icp_answers"] = icp_answers
-
+            # Update context_status + merge profile_data
+            if profile_updates:
                 await conn.execute(
                     """
-                    UPDATE bni_conversation_manager
+                    UPDATE conversation_states SET
+                        context_status = $1,
+                        profile_data = COALESCE(profile_data, '{}')::jsonb || $2::jsonb,
+                        updated_at = NOW()
+                    WHERE phone = $3
+                    """,
+                    new_status,
+                    json.dumps(profile_updates),
+                    phone_number,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE conversation_states SET
+                        context_status = $1,
+                        updated_at = NOW()
+                    WHERE phone = $2
+                    """,
+                    new_status,
+                    phone_number,
+                )
+
+            # Update metadata for special fields
+            metadata_updates = {}
+            for key in ("icp_step", "icp_answers"):
+                val = info_fields.get(key)
+                if val is not None:
+                    metadata_updates[key] = val
+
+            if metadata_updates:
+                await conn.execute(
+                    """
+                    UPDATE conversation_states
                     SET metadata = COALESCE(metadata, '{}')::jsonb || $1::jsonb
-                    WHERE member_phone = $2
+                    WHERE phone = $2
                     """,
                     json.dumps(metadata_updates),
                     phone_number,
@@ -363,130 +374,28 @@ async def _update_conversation_state(
         logger.error(f"Error updating conversation state: {e}")
 
 
-async def _handle_state_transition(
-    phone_number: str,
-    lead_id: str,
-    conversation_id: str,
-    old_status: str,
-    new_status: str,
-    info_fields: dict,
-) -> str | None:
-    """Handle side effects when conversation state changes.
-
-    Returns the overridden status if the state was changed programmatically
-    (e.g. onboarding_complete → match_suggested), or None if no override.
-    """
-    overridden_status = None
-
-    if new_status == "onboarding_complete" and old_status != "onboarding_complete":
-        from services.member_service import enrich_member_profile, find_best_match
-        await enrich_member_profile(phone_number, info_fields)
-        logger.info(f"Member profile enriched for {phone_number}")
-
-        # Auto-suggest a 1-to-1 match right after onboarding
-        match = await find_best_match(phone_number)
-        if match:
-            match_json_str = json.dumps(match)
-            async with ClientDBConnection() as conn:
-                await conn.execute(
-                    """
-                    UPDATE bni_conversation_manager
-                    SET context_status = 'match_suggested',
-                        metadata = jsonb_set(
-                            COALESCE(metadata, '{}')::jsonb,
-                            '{match_json}',
-                            $1::jsonb
-                        ),
-                        updated_at = NOW()
-                    WHERE member_phone = $2
-                    """,
-                    match_json_str,
-                    phone_number,
-                )
-            match_type = match.get("type", "unknown")
-            members_count = len(match.get("members", []))
-            logger.info(f"Match result for {phone_number}: type={match_type}, members={members_count}")
-            overridden_status = "match_suggested"
-        else:
-            logger.info(f"No suitable match found for {phone_number} after onboarding")
-
-    # Scrape website after ICP Q1 answer (icp_step transitions to 2)
-    if new_status == "icp_discovery" or (old_status == "icp_discovery" and new_status == "icp_discovery"):
-        icp_step = info_fields.get("icp_step")
-        icp_answers = info_fields.get("icp_answers", {})
-        q1_answer = icp_answers.get("q1", "")
-
-        if icp_step == 2 and q1_answer:
-            # Extract URL from Q1 answer
-            import re
-            urls = re.findall(r'(?:https?://)?(?:www\.)?[\w.-]+\.\w{2,}(?:/\S*)?', q1_answer)
-            if urls:
-                from services.website_scraper import scrape_website_for_clients
-                url = urls[0]
-                logger.info(f"Scraping website from ICP Q1: {url}")
-                scraped = await scrape_website_for_clients(url)
-
-                if scraped.get("clients") or scraped.get("services"):
-                    async with ClientDBConnection() as conn:
-                        await conn.execute(
-                            """
-                            UPDATE bni_conversation_manager
-                            SET metadata = jsonb_set(
-                                COALESCE(metadata, '{}')::jsonb,
-                                '{website_data}',
-                                $1::jsonb
-                            ),
-                            updated_at = NOW()
-                            WHERE member_phone = $2
-                            """,
-                            json.dumps(scraped),
-                            phone_number,
-                        )
-                    logger.info(
-                        f"Website scraped for {phone_number}: "
-                        f"{len(scraped.get('clients', []))} clients, "
-                        f"{len(scraped.get('services', []))} services"
-                    )
-
-    if new_status == "coordination_a_availability" and old_status == "match_suggested":
-        if info_fields.get("match_accepted"):
-            from services.meeting_scheduler import initiate_meeting_from_match
-            await initiate_meeting_from_match(phone_number, conversation_id, lead_id)
-
-    if new_status == "kpi_query" and old_status != "kpi_query":
-        from services.member_service import get_member_stats_json
-        stats = await get_member_stats_json(phone_number)
-        async with ClientDBConnection() as conn:
-            await conn.execute(
-                """
-                UPDATE bni_conversation_manager
-                SET metadata = jsonb_set(COALESCE(metadata, '{}')::jsonb, '{stats_json}', $1::jsonb)
-                WHERE member_phone = $2
-                """,
-                json.dumps(stats),
-                phone_number,
-            )
-
-    return overridden_status
-
-
 async def _chain_next_phase(
     phone_number: str,
     lead_id: str,
     conversation_id: str,
     new_status: str,
     previous_reply: str,
+    account: WhatsAppAccount,
 ) -> str | None:
-    """Run a follow-up LLM call for the overridden state.
+    """Run a follow-up LLM call for an overridden state."""
+    flow = get_flow(account.conversation_flow_template)
+    tenant_id = account.tenant_id
 
-    This makes the conversation flow seamlessly — e.g. after ICP completes,
-    the match suggestion appears in the same response without waiting for
-    another user message.
-    """
-    # Reload state (now has the overridden status + any new metadata like match_json)
-    state = await _load_conversation_state(phone_number)
+    state = await _load_conversation_state(phone_number, tenant_id)
     if not state:
         return None
+
+    profile_data = state.get("profile_data", {})
+    if isinstance(profile_data, str):
+        try:
+            profile_data = json.loads(profile_data)
+        except Exception:
+            profile_data = {}
 
     metadata = state.get("metadata", {})
     if isinstance(metadata, str):
@@ -495,42 +404,47 @@ async def _chain_next_phase(
         except Exception:
             metadata = {}
 
-    member_info = {
-        "name": state.get("member_name", ""),
-        "company_name": state.get("company_name"),
-        "industry": state.get("industry"),
-        "designation": state.get("designation"),
-        "services_offered": state.get("services_offered"),
-        "ideal_customer_profile": state.get("ideal_customer_profile"),
+    context_info = {
+        "name": state.get("contact_name", ""),
         "phone": phone_number,
+        "context_status": new_status,
     }
-    member_json = json.dumps(member_info, indent=2)
+    context_info.update(profile_data)
+    for key in ["match_json", "meeting_json", "stats_json"]:
+        if key in metadata:
+            context_info[key] = metadata[key]
 
-    prompt_name = get_prompt_name_for_status(new_status)
+    context_json = json.dumps(context_info, indent=2)
+
+    prompt_name = flow.get_prompt_name(new_status)
     logger.info(f"[CHAIN] Loading prompt '{prompt_name}' for overridden status '{new_status}'")
 
     conversation_json, prompt_template = await asyncio.gather(
-        _get_recent_messages(conversation_id, limit=10),
-        get_prompt(prompt_name),
+        _get_recent_messages(conversation_id, tenant_id, limit=10),
+        get_prompt(prompt_name, account),
     )
 
     try:
         system_prompt = prompt_template.format(
             conversation_json=conversation_json,
-            member_json=member_json,
-            match_json=metadata.get("match_json", "{}"),
-            meeting_json=metadata.get("meeting_json", "{}"),
-            stats_json=metadata.get("stats_json", "{}"),
+            context_json=context_json,
+            member_json=context_json,
+            match_json=json.dumps(metadata.get("match_json", {})),
+            meeting_json=json.dumps(metadata.get("meeting_json", {})),
+            stats_json=json.dumps(metadata.get("stats_json", {})),
             current_date=datetime.utcnow().strftime("%Y-%m-%d"),
         )
     except Exception as e:
         logger.error(f"[CHAIN] Prompt formatting failed: {e}", exc_info=True)
         return None
 
-    # Use a synthetic message so the LLM knows the previous reply context
-    synthetic_msg = f"[System: The member just completed their profile. Your previous reply was: \"{previous_reply}\". Now present the next phase naturally.]"
+    synthetic_msg = f"[System: The contact just completed their profile. Your previous reply was: \"{previous_reply}\". Now present the next phase naturally.]"
 
-    llm_response = await _call_gemini(system_prompt, synthetic_msg, phone_number)
+    gemini_model = account.ai_model if "gemini" in (account.ai_model or "").lower() else DEFAULT_GEMINI_MODEL
+    llm_response = await _call_gemini(
+        system_prompt, synthetic_msg, phone_number,
+        model=gemini_model, api_key=account.ai_api_key,
+    )
     if not llm_response:
         llm_response = await _call_openai(system_prompt, synthetic_msg, phone_number)
 
@@ -539,17 +453,16 @@ async def _chain_next_phase(
 
     agent_reply, info_fields = _parse_llm_response(llm_response)
 
-    # Update state with the chained response fields
     chained_status = info_fields.get("context_status", new_status)
-    await _update_conversation_state(phone_number, lead_id, info_fields, chained_status)
+    await _update_conversation_state(phone_number, tenant_id, info_fields, chained_status, flow)
 
     return agent_reply
 
 
-async def _get_recent_messages(conversation_id: str, limit: int = 10) -> str:
+async def _get_recent_messages(conversation_id: str, tenant_id: str, limit: int = 10) -> str:
     """Load recent messages for conversation context."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT role, content, created_at FROM messages
@@ -574,20 +487,20 @@ async def _get_recent_messages(conversation_id: str, limit: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 def _call_gemini_sync(
-    system_prompt: str, user_message: str, phone_number: str
+    system_prompt: str, user_message: str, phone_number: str,
+    model: str = DEFAULT_GEMINI_MODEL,
 ) -> str:
     """Synchronous Gemini call (runs in thread pool)."""
     _ensure_gemini_configured()
 
-    model = genai.GenerativeModel(
-        GEMINI_MODEL,
+    gmodel = genai.GenerativeModel(
+        model,
         generation_config={
             "temperature": 0.3,
             "response_mime_type": "application/json",
         },
     )
 
-    # Build chat history (Gemini format)
     history = _chat_histories.get(phone_number, [])
     gemini_history = []
     for msg in history:
@@ -604,25 +517,30 @@ def _call_gemini_sync(
     ]
     chat_history.extend(gemini_history)
 
-    chat = model.start_chat(history=chat_history)
+    chat = gmodel.start_chat(history=chat_history)
     response = chat.send_message(user_message)
     return response.text
 
 
 async def _call_gemini(
-    system_prompt: str, user_message: str, phone_number: str
+    system_prompt: str, user_message: str, phone_number: str,
+    model: str = DEFAULT_GEMINI_MODEL,
+    api_key: str | None = None,
 ) -> str | None:
     """Call Gemini LLM (primary). Returns None on failure so caller can fallback."""
-    api_key = os.getenv("GOOGLE_API_KEY", "")
-    if not api_key:
+    key = api_key or os.getenv("GOOGLE_API_KEY", "")
+    if not key:
         logger.warning("GOOGLE_API_KEY not set — skipping Gemini")
         return None
 
     try:
-        logger.info(f"Calling Gemini for {phone_number}, model={GEMINI_MODEL}")
+        if api_key:
+            genai.configure(api_key=api_key)
+
+        logger.info(f"Calling Gemini for {phone_number}, model={model}")
 
         result = await asyncio.to_thread(
-            _call_gemini_sync, system_prompt, user_message, phone_number
+            _call_gemini_sync, system_prompt, user_message, phone_number, model
         )
 
         logger.info(f"Gemini response received for {phone_number} ({len(result)} chars)")
@@ -635,7 +553,8 @@ async def _call_gemini(
 
 
 async def _call_openai(
-    system_prompt: str, user_message: str, phone_number: str
+    system_prompt: str, user_message: str, phone_number: str,
+    model: str = DEFAULT_OPENAI_MODEL,
 ) -> str | None:
     """Call OpenAI LLM (fallback). Returns None on failure."""
     api_key = os.getenv("OPENAI_API_KEY", "")
@@ -644,18 +563,17 @@ async def _call_openai(
         return None
 
     try:
-        logger.info(f"Calling OpenAI fallback for {phone_number}, model={OPENAI_MODEL}")
+        logger.info(f"Calling OpenAI fallback for {phone_number}, model={model}")
         client = _get_openai_client()
 
         messages = [{"role": "system", "content": system_prompt}]
 
-        # Add chat history (already in OpenAI format)
         history = _chat_histories.get(phone_number, [])
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
         response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=model,
             messages=messages,
             temperature=0.3,
             response_format={"type": "json_object"},
@@ -672,7 +590,7 @@ async def _call_openai(
 
 
 def _update_history(phone_number: str, user_message: str, assistant_reply: str):
-    """Update in-memory chat history (shared format for both providers)."""
+    """Update in-memory chat history."""
     if phone_number not in _chat_histories:
         _chat_histories[phone_number] = []
     _chat_histories[phone_number].append({"role": "user", "content": user_message})
@@ -683,11 +601,20 @@ def _update_history(phone_number: str, user_message: str, assistant_reply: str):
 
 def _parse_llm_response(response_text: str) -> tuple[str, dict]:
     """Parse LLM JSON response into (agent_reply, info_gathering_fields)."""
+    if not response_text or not response_text.strip():
+        logger.warning("LLM returned empty response")
+        return "", {}
+    
     try:
         data = json.loads(response_text)
-        agent_reply = data.get("agent_reply", "")
+        agent_reply = data.get("agent_reply", "").strip() if isinstance(data.get("agent_reply"), str) else data.get("agent_reply", "")
         info_fields = data.get("info_gathering_fields", {})
+        
+        # Log parsing result for debugging
+        if not agent_reply:
+            logger.warning(f"LLM returned JSON but agent_reply was empty. Full response: {response_text[:500]}")
+        
         return agent_reply, info_fields
-    except json.JSONDecodeError:
-        logger.warning("LLM response was not valid JSON, using as plain text")
+    except json.JSONDecodeError as e:
+        logger.warning(f"LLM response was not valid JSON (error: {e}), using as plain text. Response: {response_text[:500]}")
         return response_text.strip(), {"context_status": "idle"}

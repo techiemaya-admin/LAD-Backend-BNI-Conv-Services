@@ -1,15 +1,20 @@
+from __future__ import annotations
 """
 REST API for listing conversations and messages.
 
 Used by the LAD-Frontend to display conversations in the Unified Comms UI.
+Multi-tenant: uses X-Tenant-ID header for DB routing.
 """
 import json
 import logging
 import uuid
-from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel
-from db.connection import ClientDBConnection, CoreDBConnection
-from pydantic import Field
+from typing import Optional
+
+from fastapi import APIRouter, Query, Request, Depends
+from pydantic import BaseModel, Field
+
+from db.connection import AsyncDBConnection, CoreDBConnection
+from middleware.tenant import get_tenant_id
 from services.whatsapp_client import (
     send_message as send_whatsapp_message,
     get_message_templates,
@@ -81,15 +86,16 @@ async def list_conversations(
     channel: str = Query(None),
     search: str = Query(None),
     status_filter: str = Query(None, description="pending|unread|not_replied|resolved|favorites"),
-    context_status: str = Query(None, description="Filter by context_status from bni_conversation_manager"),
+    context_status: str = Query(None, description="Filter by context_status from conversation_states"),
     label_id: str = Query(None),
     sort_by: str = Query("updated_at", description="updated_at|longest_waiting"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
     """List all conversations with latest message info."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             where_clauses = ["1=1"]
             params = []
             idx = 1
@@ -100,6 +106,11 @@ async def list_conversations(
             if status:
                 where_clauses.append(f"c.status = ${idx}")
                 params.append(status)
+                idx += 1
+
+            if channel:
+                where_clauses.append(f"COALESCE(c.channel, l.channel, 'whatsapp') = ${idx}")
+                params.append(channel)
                 idx += 1
 
             if search:
@@ -121,7 +132,7 @@ async def list_conversations(
                 where_clauses.append("c.is_favorite = true")
 
             if context_status:
-                where_clauses.append(f"cm.context_status = ${idx}")
+                where_clauses.append(f"cs.context_status = ${idx}")
                 params.append(context_status)
                 idx += 1
 
@@ -153,7 +164,7 @@ async def list_conversations(
                     c.lead_id,
                     l.name AS lead_name,
                     l.phone AS lead_phone,
-                    'whatsapp' AS lead_channel,
+                    COALESCE(c.channel, l.channel, 'whatsapp') AS lead_channel,
                     c.status,
                     c.owner,
                     c.started_at,
@@ -161,7 +172,7 @@ async def list_conversations(
                     c.is_favorite,
                     c.is_pinned,
                     c.is_locked,
-                    cm.context_status,
+                    cs.context_status,
                     (SELECT content FROM messages
                      WHERE conversation_id = c.id
                      ORDER BY created_at DESC LIMIT 1) AS last_message_content,
@@ -175,7 +186,7 @@ async def list_conversations(
                      WHERE conversation_id = c.id) AS message_count
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
-                LEFT JOIN bni_conversation_manager cm ON cm.lead_id = c.lead_id
+                LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE {" AND ".join(where_clauses)}
                 ORDER BY c.is_pinned DESC NULLS LAST, {order_clause}
                 LIMIT ${idx} OFFSET ${idx + 1}
@@ -188,7 +199,7 @@ async def list_conversations(
                 SELECT COUNT(*) AS total
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
-                LEFT JOIN bni_conversation_manager cm ON cm.lead_id = c.lead_id
+                LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE {" AND ".join(where_clauses)}
                 """,
                 *params[:-2],
@@ -239,16 +250,16 @@ async def list_conversations(
 # otherwise FastAPI will match "context-statuses" as a conversation_id.
 
 @router.get("/context-statuses")
-async def list_context_statuses():
+async def list_context_statuses(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Return distinct context statuses that exist for this tenant's conversations."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
-                SELECT cm.context_status, COUNT(*) AS count
-                FROM bni_conversation_manager cm
-                WHERE cm.context_status IS NOT NULL AND cm.context_status != ''
-                GROUP BY cm.context_status
+                SELECT cs.context_status, COUNT(*) AS count
+                FROM conversation_states cs
+                WHERE cs.context_status IS NOT NULL AND cs.context_status != ''
+                GROUP BY cs.context_status
                 ORDER BY count DESC
                 """
             )
@@ -292,18 +303,21 @@ async def list_templates():
 # ── Bulk operations ──────────────────────────────────────────────
 
 @router.post("/bulk/send-template")
-async def bulk_send_template(body: BulkTemplateSendRequest):
+async def bulk_send_template(
+    body: BulkTemplateSendRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Send a WhatsApp template message to multiple conversations."""
     try:
-        async with ClientDBConnection() as conn:
-            # Resolve phone numbers and member names for all conversation IDs
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Resolve phone numbers and contact names for all conversation IDs
             rows = await conn.fetch(
                 """
                 SELECT c.id AS conversation_id, c.lead_id, l.phone,
-                       COALESCE(bcm.member_name, l.name) AS name
+                       COALESCE(cs.contact_name, l.name) AS name
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
-                LEFT JOIN bni_conversation_manager bcm ON bcm.lead_id = c.lead_id
+                LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = ANY($1::uuid[])
                 """,
                 body.conversation_ids,
@@ -360,12 +374,15 @@ async def bulk_send_template(body: BulkTemplateSendRequest):
 
 
 @router.post("/bulk/status")
-async def bulk_update_status(body: BulkStatusRequest):
+async def bulk_update_status(
+    body: BulkStatusRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update status for multiple conversations."""
     if body.status not in ("active", "resolved", "muted"):
         return {"success": False, "error": "Invalid status"}
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             result = await conn.execute(
                 "UPDATE conversations SET status = $1, updated_at = NOW() WHERE id = ANY($2::uuid[])",
                 body.status,
@@ -378,10 +395,13 @@ async def bulk_update_status(body: BulkStatusRequest):
 
 
 @router.post("/bulk/labels")
-async def bulk_add_label(body: BulkLabelsRequest):
+async def bulk_add_label(
+    body: BulkLabelsRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Add a label to multiple conversations."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             for cid in body.ids:
                 await conn.execute(
                     """
@@ -399,10 +419,13 @@ async def bulk_add_label(body: BulkLabelsRequest):
 
 
 @router.post("/bulk/delete")
-async def bulk_delete(body: BulkDeleteRequest):
+async def bulk_delete(
+    body: BulkDeleteRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Soft-delete multiple conversations."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "UPDATE conversations SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1::uuid[])",
                 body.ids,
@@ -420,10 +443,11 @@ async def list_messages(
     conversation_id: str,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
     """List messages for a conversation."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT id, conversation_id, lead_id, role, content,
@@ -469,7 +493,11 @@ async def list_messages(
 
 
 @router.post("/{conversation_id}/messages")
-async def post_message(conversation_id: str, request: Request):
+async def post_message(
+    conversation_id: str,
+    request: Request,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Send a human-agent message via WhatsApp and save to DB."""
     try:
         body = await request.json()
@@ -482,7 +510,7 @@ async def post_message(conversation_id: str, request: Request):
 
         # Look up phone number from lead if not provided
         if not phone_number and lead_id:
-            async with ClientDBConnection() as conn:
+            async with AsyncDBConnection(tenant_id) as conn:
                 lead = await conn.fetchrow(
                     "SELECT phone FROM leads WHERE id = $1::uuid", lead_id
                 )
@@ -504,7 +532,7 @@ async def post_message(conversation_id: str, request: Request):
             return {"success": False, "error": "Failed to send WhatsApp message"}
 
         # Update conversation owner to human agent
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "UPDATE conversations SET owner = 'human_agent', updated_at = NOW() WHERE id = $1::uuid",
                 conversation_id,
@@ -530,19 +558,22 @@ async def post_message(conversation_id: str, request: Request):
 
 
 @router.get("/{conversation_id}")
-async def get_conversation(conversation_id: str):
+async def get_conversation(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Get a single conversation by ID."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 SELECT c.id, c.lead_id, c.status, c.owner, c.started_at, c.updated_at,
                        c.is_favorite, c.is_pinned, c.is_locked,
                        l.name AS lead_name, l.phone AS lead_phone,
-                       cm.context_status
+                       cs.context_status
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
-                LEFT JOIN bni_conversation_manager cm ON cm.lead_id = c.lead_id
+                LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = $1::uuid
                 """,
                 conversation_id,
@@ -580,7 +611,11 @@ async def get_conversation(conversation_id: str):
 
 
 @router.patch("/{conversation_id}/status")
-async def update_status(conversation_id: str, request: Request):
+async def update_status(
+    conversation_id: str,
+    request: Request,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update conversation status (active, resolved, muted)."""
     try:
         body = await request.json()
@@ -588,7 +623,7 @@ async def update_status(conversation_id: str, request: Request):
         if new_status not in ("active", "resolved", "muted"):
             return {"success": False, "error": "Invalid status"}
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "UPDATE conversations SET status = $1, updated_at = NOW() WHERE id = $2::uuid",
                 new_status,
@@ -603,7 +638,11 @@ async def update_status(conversation_id: str, request: Request):
 
 
 @router.patch("/{conversation_id}/ownership")
-async def update_ownership(conversation_id: str, request: Request):
+async def update_ownership(
+    conversation_id: str,
+    request: Request,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Update conversation ownership (AI, human_agent)."""
     try:
         body = await request.json()
@@ -611,7 +650,7 @@ async def update_ownership(conversation_id: str, request: Request):
         if new_owner not in ("AI", "human_agent"):
             return {"success": False, "error": "Invalid owner"}
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "UPDATE conversations SET owner = $1, updated_at = NOW() WHERE id = $2::uuid",
                 new_owner,
@@ -628,10 +667,13 @@ async def update_ownership(conversation_id: str, request: Request):
 # ── CRM actions ──────────────────────────────────────────────────
 
 @router.patch("/{conversation_id}/favorite")
-async def toggle_favorite(conversation_id: str):
+async def toggle_favorite(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Toggle favorite status."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 "UPDATE conversations SET is_favorite = NOT COALESCE(is_favorite, false), updated_at = NOW() WHERE id = $1::uuid RETURNING is_favorite",
                 conversation_id,
@@ -643,10 +685,13 @@ async def toggle_favorite(conversation_id: str):
 
 
 @router.patch("/{conversation_id}/pin")
-async def toggle_pin(conversation_id: str):
+async def toggle_pin(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Toggle pin status."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 "UPDATE conversations SET is_pinned = NOT COALESCE(is_pinned, false), updated_at = NOW() WHERE id = $1::uuid RETURNING is_pinned",
                 conversation_id,
@@ -658,10 +703,13 @@ async def toggle_pin(conversation_id: str):
 
 
 @router.patch("/{conversation_id}/lock")
-async def toggle_lock(conversation_id: str):
+async def toggle_lock(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Toggle lock status (prevents AI from responding)."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 "UPDATE conversations SET is_locked = NOT COALESCE(is_locked, false), updated_at = NOW() WHERE id = $1::uuid RETURNING is_locked",
                 conversation_id,
@@ -673,10 +721,13 @@ async def toggle_lock(conversation_id: str):
 
 
 @router.delete("/{conversation_id}")
-async def soft_delete_conversation(conversation_id: str):
+async def soft_delete_conversation(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Soft-delete a conversation."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "UPDATE conversations SET is_deleted = true, updated_at = NOW() WHERE id = $1::uuid",
                 conversation_id,
@@ -690,12 +741,15 @@ async def soft_delete_conversation(conversation_id: str):
 # ── Business profile ─────────────────────────────────────────────
 
 @router.get("/{conversation_id}/business-profile")
-async def get_business_profile(conversation_id: str):
+async def get_business_profile(
+    conversation_id: str,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
     """Get the member's full business profile for a conversation."""
     try:
-        async with ClientDBConnection() as client_conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             # Get lead phone from conversation
-            conv = await client_conn.fetchrow(
+            conv = await conn.fetchrow(
                 """
                 SELECT c.lead_id, l.phone, l.name
                 FROM conversations c
@@ -709,17 +763,25 @@ async def get_business_profile(conversation_id: str):
 
             phone = conv["phone"]
 
-            # Get profile from bni_conversation_manager (client DB)
-            bcm = await client_conn.fetchrow(
+            # Get profile from conversation_states (tenant DB)
+            cs = await conn.fetchrow(
                 """
-                SELECT company_name, industry, designation, services_offered,
-                       ideal_customer_profile, metadata, context_status
-                FROM bni_conversation_manager
-                WHERE member_phone = $1
+                SELECT contact_name, profile_data, metadata, context_status
+                FROM conversation_states
+                WHERE phone = $1
                 LIMIT 1
                 """,
                 phone,
             )
+
+        # Parse profile_data and metadata from conversation_states
+        profile_data = {}
+        cs_metadata = {}
+        if cs:
+            pd = cs["profile_data"]
+            profile_data = json.loads(pd) if isinstance(pd, str) else (pd or {})
+            m = cs["metadata"]
+            cs_metadata = json.loads(m) if isinstance(m, str) else (m or {})
 
         # Get enrichment from community_roi_members (core DB)
         core_profile = None
@@ -741,33 +803,27 @@ async def get_business_profile(conversation_id: str):
         except Exception as e:
             logger.warning(f"Could not fetch core profile: {e}")
 
-        # Parse metadata JSONB
-        bcm_metadata = {}
-        if bcm and bcm["metadata"]:
-            m = bcm["metadata"]
-            bcm_metadata = json.loads(m) if isinstance(m, str) else m
-
         core_metadata = {}
         if core_profile and core_profile["metadata"]:
             m = core_profile["metadata"]
             core_metadata = json.loads(m) if isinstance(m, str) else m
 
-        website_data = bcm_metadata.get("website_data", {})
-        icp_answers = bcm_metadata.get("icp_answers", {})
+        website_data = cs_metadata.get("website_data", {})
+        icp_answers = cs_metadata.get("icp_answers", {})
 
         profile = {
-            "member_name": conv["name"] or (bcm["designation"] if bcm else None),
+            "member_name": conv["name"] or (cs["contact_name"] if cs else None),
             "phone": phone,
             "email": core_profile["email"] if core_profile else None,
-            "company_name": (bcm["company_name"] if bcm else None)
+            "company_name": profile_data.get("company_name")
                 or (core_profile["company_name"] if core_profile else None),
-            "industry": (bcm["industry"] if bcm else None)
+            "industry": profile_data.get("industry")
                 or (core_profile["industry"] if core_profile else None),
-            "designation": (bcm["designation"] if bcm else None)
+            "designation": profile_data.get("designation")
                 or (core_profile["designation"] if core_profile else None),
-            "services_offered": bcm["services_offered"] if bcm else None,
-            "ideal_customer_profile": bcm["ideal_customer_profile"] if bcm else None,
-            "context_status": bcm["context_status"] if bcm else None,
+            "services_offered": profile_data.get("services_offered"),
+            "ideal_customer_profile": profile_data.get("ideal_customer_profile"),
+            "context_status": cs["context_status"] if cs else None,
             # Website / social data
             "website": icp_answers.get("q1", website_data.get("raw_url", "")),
             "website_about": website_data.get("about"),
@@ -786,7 +842,7 @@ async def get_business_profile(conversation_id: str):
             "current_streak": core_profile["current_streak"] if core_profile else 0,
             "max_streak": core_profile["max_streak"] if core_profile else 0,
             # Onboarding
-            "onboarding_completed_at": bcm_metadata.get("onboarding_completed_at")
+            "onboarding_completed_at": cs_metadata.get("onboarding_completed_at")
                 or core_metadata.get("onboarding_completed_at"),
         }
 

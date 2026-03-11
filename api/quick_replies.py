@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Quick Replies API — manage canned/template responses for agents.
 
@@ -8,11 +9,13 @@ Endpoints:
   DELETE /api/quick-replies/{id}  — delete
 """
 import logging
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,9 @@ def _row_to_dict(r) -> dict:
 
 
 @router.get("")
-async def list_quick_replies():
+async def list_quick_replies(tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 "SELECT * FROM quick_replies ORDER BY category NULLS LAST, title"
             )
@@ -59,9 +62,9 @@ async def list_quick_replies():
 
 
 @router.post("")
-async def create_quick_reply(body: QuickReplyCreate):
+async def create_quick_reply(body: QuickReplyCreate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO quick_replies (title, shortcut, content, category)
@@ -80,13 +83,13 @@ async def create_quick_reply(body: QuickReplyCreate):
 
 
 @router.put("/{reply_id}")
-async def update_quick_reply(reply_id: str, body: QuickReplyUpdate):
+async def update_quick_reply(reply_id: str, body: QuickReplyUpdate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
         updates = body.model_dump(exclude_none=True)
         if not updates:
             return {"success": False, "error": "No fields to update"}
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             # Build dynamic SET clause
             set_parts = []
             params = []
@@ -116,9 +119,9 @@ async def update_quick_reply(reply_id: str, body: QuickReplyUpdate):
 
 
 @router.delete("/{reply_id}")
-async def delete_quick_reply(reply_id: str):
+async def delete_quick_reply(reply_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "DELETE FROM quick_replies WHERE id = $1::uuid", reply_id
             )

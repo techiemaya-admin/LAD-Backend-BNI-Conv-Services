@@ -1,29 +1,27 @@
+from __future__ import annotations
 """
-Member service — profile management and ICP-based matching.
+BNI Member Service — profile management and ICP-based matching.
 
 Reads from community_roi_members (salesmaya_agent) for member data.
 Writes enriched profiles back after onboarding completion.
 Scores potential matches based on ICP compatibility.
+
+Moved from services/member_service.py — now accepts tenant_id parameter
+instead of using get_tenant_id().
 """
 import json
 import logging
-import uuid
 from datetime import datetime
 
-from db.connection import CoreDBConnection, ClientDBConnection
-from db.schema import core_table, get_tenant_id
+from db.connection import CoreDBConnection, AsyncDBConnection
+from db.schema import core_table
 
 logger = logging.getLogger(__name__)
 
 
-async def enrich_member_profile(phone_number: str, info_fields: dict):
-    """Write onboarding-collected profile data to community_roi_members.
-
-    Called when context_status transitions to 'onboarding_complete'.
-    Updates the member record that matches the phone number.
-    """
+async def enrich_member_profile(phone_number: str, info_fields: dict, tenant_id: str):
+    """Write onboarding-collected profile data to community_roi_members."""
     try:
-        tenant_id = get_tenant_id()
         async with CoreDBConnection() as conn:
             member = await conn.fetchrow(
                 f"""
@@ -64,10 +62,9 @@ async def enrich_member_profile(phone_number: str, info_fields: dict):
         logger.error(f"Error enriching member profile: {e}", exc_info=True)
 
 
-async def get_member_stats_json(phone_number: str) -> dict:
+async def get_member_stats_json(phone_number: str, tenant_id: str) -> dict:
     """Get member KPI stats for LLM context."""
     try:
-        tenant_id = get_tenant_id()
         async with CoreDBConnection() as conn:
             member = await conn.fetchrow(
                 f"""
@@ -105,26 +102,15 @@ async def get_member_stats_json(phone_number: str) -> dict:
         return {"error": str(e)}
 
 
-async def find_best_match(phone_number: str) -> dict | None:
-    """Find the best 1-to-1 match for a member using ICP-based scoring.
-
-    Scoring:
-      - ICP match (35 pts): candidate's industry/services match member's ICP
-      - Reverse ICP (25 pts): member matches candidate's ICP
-      - Never-met bonus (40 pts): only suggest members never met before
-      - Activity bonus (up to 10 pts): prefer active members
-
-    Returns the top candidate dict or None if no suitable match.
-    """
+async def find_best_match(phone_number: str, tenant_id: str) -> dict | None:
+    """Find the best 1-to-1 match for a member using ICP-based scoring."""
     try:
-        tenant_id = get_tenant_id()
-
-        # Also load ICP answers from bni_conversation_manager for richer matching
+        # Load ICP answers from conversation_states for richer matching
         icp_answers_text = ""
         try:
-            async with ClientDBConnection() as bni_conn:
+            async with AsyncDBConnection(tenant_id) as bni_conn:
                 cm_row = await bni_conn.fetchrow(
-                    "SELECT metadata FROM bni_conversation_manager WHERE member_phone = $1",
+                    "SELECT metadata FROM conversation_states WHERE phone = $1",
                     phone_number,
                 )
                 if cm_row:
@@ -138,7 +124,6 @@ async def find_best_match(phone_number: str) -> dict | None:
             logger.warning(f"Could not load ICP answers for matching: {e}")
 
         async with CoreDBConnection() as conn:
-            # Get the requesting member
             member = await conn.fetchrow(
                 f"""
                 SELECT id, name, company_name, industry, metadata
@@ -150,8 +135,7 @@ async def find_best_match(phone_number: str) -> dict | None:
                 tenant_id,
             )
             if not member:
-                # Member not in community_roi_members — still try fallback
-                fallback = await _get_unmet_members_fallback_no_member(phone_number, conn)
+                fallback = await _get_unmet_members_fallback_no_member(phone_number, conn, tenant_id)
                 if fallback:
                     return {"type": "fallback_list", "members": fallback}
                 return None
@@ -161,10 +145,8 @@ async def find_best_match(phone_number: str) -> dict | None:
             member_icp = member_metadata.get("ideal_customer_profile", "")
             member_services = member_metadata.get("services_offered", "")
 
-            # Combine ICP summary + raw ICP answers for richer keyword matching
             icp_text = f"{member_icp} {icp_answers_text}".lower().strip()
 
-            # Get all other active members
             candidates = await conn.fetch(
                 f"""
                 SELECT id, name, company_name, industry, phone, metadata,
@@ -181,7 +163,6 @@ async def find_best_match(phone_number: str) -> dict | None:
             if not candidates:
                 return None
 
-            # Get relationship scores for this member
             relationships = await conn.fetch(
                 f"""
                 SELECT member_b_id, one_to_one_count
@@ -197,10 +178,10 @@ async def find_best_match(phone_number: str) -> dict | None:
             )
             met_counts = {str(r["member_b_id"]): r["one_to_one_count"] for r in relationships}
 
-        # Check which candidates already have pending meetings
+        # Check pending meetings
         pending_phones = set()
         try:
-            async with ClientDBConnection() as conn:
+            async with AsyncDBConnection(tenant_id) as conn:
                 rows = await conn.fetch(
                     """
                     SELECT member_b_phone FROM scheduled_meetings
@@ -213,7 +194,7 @@ async def find_best_match(phone_number: str) -> dict | None:
                 )
                 pending_phones = {r[0] for r in rows}
         except Exception:
-            pass  # Table might not exist yet
+            pass
 
         # Score each candidate
         scored = []
@@ -224,30 +205,25 @@ async def find_best_match(phone_number: str) -> dict | None:
             c_services = c_meta.get("services_offered", "")
             c_phone = c["phone"]
 
-            # Skip candidates with pending meetings
             if c_phone in pending_phones:
                 continue
 
-            # Only suggest members never met before
             meetings_with = met_counts.get(cid, 0)
             if meetings_with > 0:
                 continue
 
             score = 0
 
-            # ICP match (35 pts): does the candidate match what the member is looking for?
+            # ICP match (35 pts)
             if icp_text and (c["industry"] or c_services or c["company_name"]):
-                # Check industry category (e.g. "Construction > Elevators")
                 if c["industry"]:
                     industry_parts = [p.strip().lower() for p in c["industry"].split(">")]
                     for part in industry_parts:
-                        # Match industry keywords against ICP text + raw answers
                         words = [w for w in part.split() if len(w) > 2]
                         matching_words = sum(1 for w in words if w in icp_text)
                         if matching_words > 0:
                             score += min(matching_words * 5, 15)
 
-                # Check candidate's services against member's ICP
                 if c_services:
                     for svc in c_services.split(","):
                         svc_clean = svc.strip().lower()
@@ -255,16 +231,14 @@ async def find_best_match(phone_number: str) -> dict | None:
                             score += 10
                             break
 
-                # Check company name keywords (e.g. "Snap Fitness" matching "gym/fitness" in ICP)
                 if c["company_name"]:
                     comp_words = [w.lower() for w in c["company_name"].split() if len(w) > 3]
                     if any(w in icp_text for w in comp_words):
                         score += 10
 
-            # Cap ICP match at 35
             score = min(score, 35)
 
-            # Reverse ICP (25 pts): does the member match what the candidate is looking for?
+            # Reverse ICP (25 pts)
             if c_icp and (member["industry"] or member_services):
                 c_icp_lower = c_icp.lower()
                 if member["industry"] and member["industry"].lower() in c_icp_lower:
@@ -275,7 +249,7 @@ async def find_best_match(phone_number: str) -> dict | None:
                 ):
                     score += 10
 
-            # Never-met bonus (40 pts) — all candidates here are unmet
+            # Never-met bonus (40 pts)
             score += 40
 
             # Activity bonus (up to 10 pts)
@@ -294,13 +268,11 @@ async def find_best_match(phone_number: str) -> dict | None:
             })
 
         if not scored:
-            # Fallback: return 5 random unmet members
             fallback = await _get_unmet_members_fallback(phone_number, candidates, met_counts, pending_phones)
             if fallback:
                 return {"type": "fallback_list", "members": fallback}
             return None
 
-        # Sort by score descending, return top 4 matches
         scored.sort(key=lambda x: x["score"], reverse=True)
         top_matches = scored[:4]
         logger.info(
@@ -317,7 +289,7 @@ async def find_best_match(phone_number: str) -> dict | None:
 async def _get_unmet_members_fallback(
     phone_number: str, candidates, met_counts: dict, pending_phones: set, limit: int = 5
 ) -> list[dict]:
-    """Fallback: pick up to `limit` unmet members when ICP scoring yields no results."""
+    """Fallback: pick unmet members when ICP scoring yields no results."""
     unmet = []
     for c in candidates:
         cid = str(c["id"])
@@ -336,18 +308,13 @@ async def _get_unmet_members_fallback(
         })
         if len(unmet) >= limit:
             break
-    logger.info(f"Fallback: returning {len(unmet)} unmet members for {phone_number}")
     return unmet
 
 
 async def _get_unmet_members_fallback_no_member(
-    phone_number: str, conn, limit: int = 5
+    phone_number: str, conn, tenant_id: str, limit: int = 5
 ) -> list[dict]:
-    """Fallback when member doesn't exist in community_roi_members.
-
-    Just pick 5 random active members as suggestions.
-    """
-    tenant_id = get_tenant_id()
+    """Fallback when member doesn't exist in community_roi_members."""
     candidates = await conn.fetch(
         f"""
         SELECT name, company_name, industry, phone, metadata
@@ -372,12 +339,11 @@ async def _get_unmet_members_fallback_no_member(
             "services_offered": c_meta.get("services_offered", ""),
             "phone": c["phone"],
         })
-    logger.info(f"Fallback (no member record): returning {len(result)} random members for {phone_number}")
     return result
 
 
 def _build_match_reason(candidate: dict, member_icp: str) -> str:
-    """Build a human-readable reason why this candidate is a good match."""
+    """Build a human-readable match reason."""
     parts = []
     if candidate["company_name"]:
         parts.append(f"They run {candidate['company_name']}")
@@ -388,10 +354,9 @@ def _build_match_reason(candidate: dict, member_icp: str) -> str:
     return ", ".join(parts) if parts else "Great networking opportunity"
 
 
-async def get_member_by_phone(phone_number: str) -> dict | None:
+async def get_member_by_phone(phone_number: str, tenant_id: str) -> dict | None:
     """Look up a community_roi_members record by phone."""
     try:
-        tenant_id = get_tenant_id()
         async with CoreDBConnection() as conn:
             row = await conn.fetchrow(
                 f"""

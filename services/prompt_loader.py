@@ -1,63 +1,91 @@
 """
-Load prompts from the bni_prompts table.
+Generic prompt loader.
+
+Loads prompts from the per-tenant `prompts` table.
 Falls back to a generic default if DB is unavailable.
+
+The flow template's status_to_prompt mapping determines which prompt
+name to load for a given context_status (handled by flow_registry).
 """
+from __future__ import annotations
+
 import logging
-from db.connection import ClientDBConnection
+from typing import Optional, TYPE_CHECKING
+
+from db.connection import AsyncDBConnection
+
+if TYPE_CHECKING:
+    from services.account_registry import WhatsAppAccount
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache
-_prompt_cache: dict[str, str] = {}
-
-# Map context_status to prompt name
-STATUS_TO_PROMPT = {
-    "onboarding_greeting": "ONBOARDING_GREETING",
-    "onboarding_profile": "ONBOARDING_PROFILE",
-    "icp_discovery": "ICP_DISCOVERY",
-    "onboarding_complete": "ONBOARDING_COMPLETE",
-    "match_suggested": "MATCH_SUGGESTION",
-    "coordination_a_availability": "COORDINATION_AVAILABILITY",
-    "coordination_b_availability": "COORDINATION_AVAILABILITY",
-    "coordination_overlap_proposed": "COORDINATION_AVAILABILITY",
-    "post_meeting_followup": "POST_MEETING_FOLLOWUP",
-    "kpi_query": "KPI_QUERY",
-    "general_qa": "GENERAL_QA",
-    "idle": "IDLE",
-}
-
 FALLBACK_PROMPT = (
-    "You are the BNI Rising Phoenix AI Networking Assistant. "
-    "Answer the member's question helpfully.\n\n"
+    "You are an AI assistant on WhatsApp. "
+    "Answer the person's question helpfully.\n\n"
     "Conversation history:\n{conversation_json}\n\n"
+    "Contact info:\n{context_json}\n\n"
     "Return JSON:\n"
-    '{{\"agent_reply\": \"your answer\", \"info_gathering_fields\": {{\"context_status\": \"idle\"}}}}'
+    '{{\"agent_reply\": \"your answer\", \"info_gathering_fields\": {{\"context_status\": \"active\"}}}}'
 )
 
 
-async def get_prompt(name: str) -> str:
-    """Load a prompt by name. Always reads from DB so edits take effect immediately."""
-    try:
-        async with ClientDBConnection() as conn:
-            row = await conn.fetchrow(
-                "SELECT prompt_text FROM bni_prompts WHERE name = $1 AND is_active = true",
-                name,
-            )
-            if row:
-                return row["prompt_text"]
-    except Exception as e:
-        logger.warning(f"Could not load prompt '{name}' from DB: {e}")
+async def get_prompt(name: str, account: Optional[WhatsAppAccount] = None) -> str:
+    """Load a prompt by name from the tenant's prompts table.
 
-    logger.warning(f"Prompt '{name}' not found in DB — using generic fallback")
+    Always reads from DB so edits take effect immediately.
+    Falls back to generic prompt if DB unavailable.
+    """
+    tenant_id = account.tenant_id if account else None
+
+    if tenant_id:
+        try:
+            async with AsyncDBConnection(tenant_id) as conn:
+                row = await conn.fetchrow(
+                    "SELECT prompt_text FROM prompts WHERE name = $1 AND is_active = true AND tenant_id = $2::uuid",
+                    name,
+                    tenant_id,
+                )
+                if row:
+                    return row["prompt_text"]
+
+                # Fallback: try without tenant_id filter (for shared prompts)
+                row = await conn.fetchrow(
+                    "SELECT prompt_text FROM prompts WHERE name = $1 AND is_active = true",
+                    name,
+                )
+                if row:
+                    return row["prompt_text"]
+        except Exception as e:
+            logger.warning(f"Could not load prompt '{name}' from prompts table: {e}")
+
+        # Try legacy bni_prompts table as fallback during migration
+        try:
+            async with AsyncDBConnection(tenant_id) as conn:
+                row = await conn.fetchrow(
+                    "SELECT prompt_text FROM bni_prompts WHERE name = $1 AND is_active = true",
+                    name,
+                )
+                if row:
+                    logger.debug(f"Loaded prompt '{name}' from legacy bni_prompts table")
+                    return row["prompt_text"]
+        except Exception:
+            pass  # Table may not exist for non-BNI tenants
+
+    logger.warning(f"Prompt '{name}' not found — using generic fallback")
     return FALLBACK_PROMPT
 
 
-def get_prompt_name_for_status(context_status: str) -> str:
-    """Map a context_status to the prompt name."""
-    return STATUS_TO_PROMPT.get(context_status, "GENERAL_QA")
+def get_prompt_name_for_status(context_status: str, flow_template: str = "generic") -> str:
+    """Map a context_status to the prompt name using the flow template.
+
+    Kept for backward compatibility — the conversation engine now uses
+    flow.get_prompt_name() directly.
+    """
+    from services.flow_registry import get_flow
+    flow = get_flow(flow_template)
+    return flow.get_prompt_name(context_status)
 
 
 def clear_prompt_cache():
-    """Clear the in-memory prompt cache so prompts are re-read from DB."""
-    _prompt_cache.clear()
-    logger.info("Prompt cache cleared")
+    """Clear the in-memory prompt cache (no-op now, reads are always live)."""
+    logger.info("Prompt cache cleared (no-op)")
