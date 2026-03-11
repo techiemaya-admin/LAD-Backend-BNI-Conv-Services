@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Notes API — manage conversation notes.
 
@@ -8,11 +9,13 @@ Endpoints:
   DELETE /api/notes/{id}                — delete note
 """
 import logging
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +45,9 @@ def _row_to_dict(r) -> dict:
 
 
 @router.get("/api/conversations/{conversation_id}/notes")
-async def list_notes(conversation_id: str):
+async def list_notes(conversation_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT * FROM conversation_notes
@@ -60,9 +63,9 @@ async def list_notes(conversation_id: str):
 
 
 @router.post("/api/conversations/{conversation_id}/notes")
-async def create_note(conversation_id: str, body: NoteCreate):
+async def create_note(conversation_id: str, body: NoteCreate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO conversation_notes (conversation_id, lead_id, content, author_name)
@@ -81,9 +84,9 @@ async def create_note(conversation_id: str, body: NoteCreate):
 
 
 @router.put("/api/notes/{note_id}")
-async def update_note(note_id: str, body: NoteUpdate):
+async def update_note(note_id: str, body: NoteUpdate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 UPDATE conversation_notes
@@ -103,9 +106,9 @@ async def update_note(note_id: str, body: NoteUpdate):
 
 
 @router.delete("/api/notes/{note_id}")
-async def delete_note(note_id: str):
+async def delete_note(note_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 "DELETE FROM conversation_notes WHERE id = $1::uuid", note_id
             )

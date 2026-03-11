@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Chat Groups API — create groups, tag conversations, and broadcast templates.
 
@@ -12,11 +13,13 @@ Endpoints:
   POST   /api/chat-groups/{group_id}/send-template           — send template to entire group
 """
 import logging
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 from services.whatsapp_client import send_template_message
 
 logger = logging.getLogger(__name__)
@@ -44,16 +47,16 @@ class ChatGroupAddConversations(BaseModel):
 
 class ChatGroupTemplateSend(BaseModel):
     template_name: str
-    language_code: str = "en_US"
+    language_code: str = "en_GB"
     parameters: list[str] | None = None
 
 
 # ── Group CRUD ────────────────────────────────────────────────────
 
 @router.get("/api/chat-groups")
-async def list_chat_groups():
+async def list_chat_groups(tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch("""
                 SELECT g.id, g.name, g.color, g.description, g.created_at,
                        COUNT(cgc.conversation_id) AS conversation_count
@@ -82,9 +85,9 @@ async def list_chat_groups():
 
 
 @router.post("/api/chat-groups")
-async def create_chat_group(body: ChatGroupCreate):
+async def create_chat_group(body: ChatGroupCreate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO chat_groups (name, color, description)
@@ -112,13 +115,13 @@ async def create_chat_group(body: ChatGroupCreate):
 
 
 @router.put("/api/chat-groups/{group_id}")
-async def update_chat_group(group_id: str, body: ChatGroupUpdate):
+async def update_chat_group(group_id: str, body: ChatGroupUpdate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
         updates = body.model_dump(exclude_none=True)
         if not updates:
             return {"success": False, "error": "No fields to update"}
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             set_parts = []
             params = []
             idx = 1
@@ -155,9 +158,9 @@ async def update_chat_group(group_id: str, body: ChatGroupUpdate):
 
 
 @router.delete("/api/chat-groups/{group_id}")
-async def delete_chat_group(group_id: str):
+async def delete_chat_group(group_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute("DELETE FROM chat_groups WHERE id = $1::uuid", group_id)
             return {"success": True}
     except Exception as e:
@@ -168,9 +171,9 @@ async def delete_chat_group(group_id: str):
 # ── Group–Conversation association ────────────────────────────────
 
 @router.get("/api/chat-groups/{group_id}/conversations")
-async def list_group_conversations(group_id: str):
+async def list_group_conversations(group_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 "SELECT conversation_id FROM chat_group_conversations WHERE group_id = $1::uuid",
                 group_id,
@@ -185,9 +188,9 @@ async def list_group_conversations(group_id: str):
 
 
 @router.post("/api/chat-groups/{group_id}/conversations")
-async def add_conversations_to_group(group_id: str, body: ChatGroupAddConversations):
+async def add_conversations_to_group(group_id: str, body: ChatGroupAddConversations, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             for conv_id in body.conversation_ids:
                 await conn.execute(
                     """
@@ -205,9 +208,9 @@ async def add_conversations_to_group(group_id: str, body: ChatGroupAddConversati
 
 
 @router.delete("/api/chat-groups/{group_id}/conversations/{conversation_id}")
-async def remove_conversation_from_group(group_id: str, conversation_id: str):
+async def remove_conversation_from_group(group_id: str, conversation_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
                 DELETE FROM chat_group_conversations
@@ -222,13 +225,152 @@ async def remove_conversation_from_group(group_id: str, conversation_id: str):
         return {"success": False, "error": str(e)}
 
 
+# ── Group detail with members ─────────────────────────────────────
+
+@router.get("/api/chat-groups/{group_id}/detail")
+async def get_group_detail(group_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
+    """Get group info with member list (name, phone, avatar initials)."""
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            group = await conn.fetchrow(
+                "SELECT id, name, color, description FROM chat_groups WHERE id = $1::uuid",
+                group_id,
+            )
+            if not group:
+                return {"success": False, "error": "Group not found"}
+
+            members = await conn.fetch("""
+                SELECT DISTINCT ON (l.id)
+                    l.id AS lead_id, l.name, l.phone, l.email, l.company,
+                    c.id AS conversation_id, c.channel
+                FROM chat_group_conversations cgc
+                JOIN conversations c ON c.id = cgc.conversation_id
+                LEFT JOIN leads l ON l.id = c.lead_id
+                WHERE cgc.group_id = $1::uuid
+                ORDER BY l.id, c.updated_at DESC
+            """, group_id)
+
+            return {
+                "success": True,
+                "data": {
+                    "id": str(group["id"]),
+                    "name": group["name"],
+                    "color": group["color"],
+                    "description": group["description"],
+                    "members": [
+                        {
+                            "lead_id": str(m["lead_id"]) if m["lead_id"] else None,
+                            "name": m["name"] or "Unknown",
+                            "phone": m["phone"],
+                            "email": m["email"],
+                            "company": m["company"],
+                            "conversation_id": str(m["conversation_id"]),
+                            "channel": m["channel"] or "whatsapp",
+                        }
+                        for m in members
+                    ],
+                    "member_count": len(members),
+                },
+            }
+    except Exception as e:
+        logger.error(f"Error fetching group detail: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+# ── Group aggregated messages (WhatsApp group chat view) ─────────
+
+@router.get("/api/chat-groups/{group_id}/messages")
+async def get_group_messages(
+    group_id: str,
+    limit: int = 50,
+    before: str = None,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """
+    Fetch messages from ALL conversations in a group, merged chronologically.
+    Each message includes sender name + phone for group chat display.
+    """
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Get conversation IDs in this group
+            conv_rows = await conn.fetch(
+                "SELECT conversation_id FROM chat_group_conversations WHERE group_id = $1::uuid",
+                group_id,
+            )
+            conv_ids = [str(r["conversation_id"]) for r in conv_rows]
+            if not conv_ids:
+                return {"success": True, "data": [], "has_more": False}
+
+            where = "m.conversation_id = ANY($1::uuid[])"
+            params = [conv_ids]
+            idx = 2
+
+            if before:
+                where += f" AND m.created_at < ${idx}::timestamptz"
+                params.append(before)
+                idx += 1
+
+            params.append(limit + 1)  # fetch one extra to check has_more
+
+            rows = await conn.fetch(f"""
+                SELECT
+                    m.id,
+                    m.conversation_id,
+                    m.content,
+                    m.role,
+                    m.message_status,
+                    m.created_at,
+                    m.metadata,
+                    m.intent,
+                    l.name AS sender_name,
+                    l.phone AS sender_phone,
+                    l.company AS sender_company,
+                    COALESCE(c.channel, 'whatsapp') AS channel
+                FROM messages m
+                LEFT JOIN conversations c ON c.id = m.conversation_id
+                LEFT JOIN leads l ON l.id = c.lead_id
+                WHERE {where}
+                ORDER BY m.created_at DESC
+                LIMIT ${idx}
+            """, *params)
+
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+
+            data = []
+            for r in rows:
+                data.append({
+                    "id": str(r["id"]),
+                    "conversation_id": str(r["conversation_id"]),
+                    "content": r["content"],
+                    "role": r["role"],
+                    "message_status": r["message_status"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "intent": r["intent"],
+                    "sender_name": r["sender_name"] or "Unknown",
+                    "sender_phone": r["sender_phone"],
+                    "sender_company": r["sender_company"],
+                    "channel": r["channel"],
+                    "is_outgoing": r["role"] in ("assistant", "agent", "system"),
+                })
+
+            return {
+                "success": True,
+                "data": data,
+                "has_more": has_more,
+            }
+    except Exception as e:
+        logger.error(f"Error fetching group messages: {e}", exc_info=True)
+        return {"success": False, "data": [], "has_more": False, "error": str(e)}
+
+
 # ── Group template broadcast ──────────────────────────────────────
 
 @router.post("/api/chat-groups/{group_id}/send-template")
-async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend):
+async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend, tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Send a WhatsApp template message to all conversations in a group."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             # Get all conversation IDs for this group
             group_rows = await conn.fetch(
                 "SELECT conversation_id FROM chat_group_conversations WHERE group_id = $1::uuid",
@@ -239,12 +381,14 @@ async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend):
             if not conversation_ids:
                 return {"success": True, "data": {"sent_count": 0, "failed_count": 0, "sent": [], "failed": []}}
 
-            # Resolve phone numbers
+            # Resolve phone numbers and member names
             rows = await conn.fetch(
                 """
-                SELECT c.id AS conversation_id, c.lead_id, l.phone, l.name
+                SELECT c.id AS conversation_id, c.lead_id, l.phone,
+                       COALESCE(cs.contact_name, l.name) AS name
                 FROM conversations c
                 LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = ANY($1::uuid[])
                 """,
                 conversation_ids,
@@ -260,12 +404,13 @@ async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend):
 
             params = None
             if body.parameters:
-                member_name = r["name"] or "there"
+                full_name = r["name"] or "there"
+                first_name = full_name.split()[0] if full_name != "there" else "there"
                 params = [
-                    p.replace("{member_name}", member_name)
-                     .replace("{member-name}", member_name)
-                     .replace("{first_name}", member_name.split()[0] if member_name != "there" else "there")
-                     .replace("{first-name}", member_name.split()[0] if member_name != "there" else "there")
+                    p.replace("{member_name}", first_name)
+                     .replace("{member-name}", first_name)
+                     .replace("{first_name}", first_name)
+                     .replace("{first-name}", first_name)
                     for p in body.parameters
                 ]
 

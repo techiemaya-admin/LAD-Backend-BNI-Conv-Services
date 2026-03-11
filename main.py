@@ -1,9 +1,12 @@
 """
-BNI Conversation Service
+WhatsApp AI Agent Platform
 
-WhatsApp AI agent for BNI Rising Phoenix chapter.
-Handles member onboarding, 1-to-1 matching, meeting coordination,
-reminders, and post-meeting follow-ups.
+Multi-tenant WhatsApp AI agent service supporting multiple industry clients.
+Each client gets its own conversation flow template (BNI, generic, etc.),
+isolated database tables, and per-account AI configuration.
+
+Routing via slug-based webhooks: /webhook/{slug}
+Configuration stored in lad_dev.social_whatsapp_accounts.
 """
 import logging
 from contextlib import asynccontextmanager
@@ -23,9 +26,18 @@ from api.quick_replies import router as quick_replies_router
 from api.notes import router as notes_router
 from api.chat_groups import router as chat_groups_router
 from api.prompts import router as prompts_router
-from tasks.reminder_task import send_meeting_reminders
-from tasks.followup_task import send_post_meeting_followups
-from tasks.icp_followup_task import send_icp_followups
+from api.followups import router as followups_router
+from api.ownership import router as ownership_router
+from api.admin import router as admin_router
+from api.personal_webhook import router as personal_webhook_router
+from api.leads import router as leads_router
+from services.account_registry import load_accounts, get_accounts_by_flow
+from modules.bni import register_bni_flow
+from modules.bni.tasks import (
+    send_meeting_reminders,
+    send_post_meeting_followups,
+    send_icp_followups,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,33 +48,45 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting BNI Conversation Service")
+    logger.info("Starting WhatsApp AI Agent Platform")
     try:
         await init_pools()
         logger.info("Database pools initialized")
         await ensure_crm_tables()
+
+        # Register flow templates before loading accounts
+        register_bni_flow()
+
+        await load_accounts()
+        logger.info("WhatsApp account configs loaded")
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         logger.warning("Service starting without DB — requests will fail")
 
-    # Start background scheduler for reminders and followups
+    # Start background scheduler
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_meeting_reminders, "interval", minutes=5, id="reminders")
-    scheduler.add_job(send_post_meeting_followups, "interval", minutes=15, id="followups")
-    scheduler.add_job(send_icp_followups, "interval", minutes=60, id="icp_followups")
+
+    # BNI-specific tasks only if BNI accounts exist
+    bni_accounts = get_accounts_by_flow("bni")
+    if bni_accounts:
+        scheduler.add_job(send_meeting_reminders, "interval", minutes=5, id="reminders")
+        scheduler.add_job(send_post_meeting_followups, "interval", minutes=15, id="followups")
+        scheduler.add_job(send_icp_followups, "interval", minutes=60, id="icp_followups")
+        logger.info(f"BNI tasks registered for {len(bni_accounts)} account(s)")
+
     scheduler.start()
-    logger.info("Background scheduler started (reminders=5min, followups=15min, icp_followups=60min)")
+    logger.info("Background scheduler started")
 
     yield
 
     scheduler.shutdown()
     await close_pools()
-    logger.info("BNI Conversation Service stopped")
+    logger.info("WhatsApp AI Agent Platform stopped")
 
 
 app = FastAPI(
-    title="BNI Conversation Service",
-    version="1.0.0",
+    title="WhatsApp AI Agent Platform",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -87,3 +111,8 @@ app.include_router(quick_replies_router)
 app.include_router(notes_router)
 app.include_router(chat_groups_router)
 app.include_router(prompts_router)
+app.include_router(followups_router)
+app.include_router(ownership_router)
+app.include_router(admin_router)
+app.include_router(personal_webhook_router)
+app.include_router(leads_router)

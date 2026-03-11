@@ -10,11 +10,13 @@ Endpoints:
   GET    /api/conversations/{id}/labels            — list labels for conversation
 """
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
+from middleware.tenant import get_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,9 @@ class LabelAttach(BaseModel):
 # ── Label CRUD ───────────────────────────────────────────────────
 
 @router.get("/api/labels")
-async def list_labels():
+async def list_labels(tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 "SELECT id, name, color, created_at FROM labels ORDER BY name"
             )
@@ -57,9 +59,9 @@ async def list_labels():
 
 
 @router.post("/api/labels")
-async def create_label(body: LabelCreate):
+async def create_label(body: LabelCreate, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO labels (name, color) VALUES ($1, $2)
@@ -83,9 +85,9 @@ async def create_label(body: LabelCreate):
 
 
 @router.delete("/api/labels/{label_id}")
-async def delete_label(label_id: str):
+async def delete_label(label_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute("DELETE FROM labels WHERE id = $1::uuid", label_id)
             return {"success": True}
     except Exception as e:
@@ -96,9 +98,9 @@ async def delete_label(label_id: str):
 # ── Conversation–Label association ────────────────────────────────
 
 @router.get("/api/conversations/{conversation_id}/labels")
-async def get_conversation_labels(conversation_id: str):
+async def get_conversation_labels(conversation_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT l.id, l.name, l.color
@@ -122,9 +124,9 @@ async def get_conversation_labels(conversation_id: str):
 
 
 @router.post("/api/conversations/{conversation_id}/labels")
-async def attach_label(conversation_id: str, body: LabelAttach):
+async def attach_label(conversation_id: str, body: LabelAttach, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO conversation_labels (conversation_id, label_id)
@@ -141,9 +143,9 @@ async def attach_label(conversation_id: str, body: LabelAttach):
 
 
 @router.delete("/api/conversations/{conversation_id}/labels/{label_id}")
-async def detach_label(conversation_id: str, label_id: str):
+async def detach_label(conversation_id: str, label_id: str, tenant_id: Optional[str] = Depends(get_tenant_id)):
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
                 DELETE FROM conversation_labels

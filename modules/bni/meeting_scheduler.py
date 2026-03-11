@@ -1,39 +1,32 @@
+from __future__ import annotations
 """
-Meeting scheduler — two-member async coordination.
+BNI Meeting Scheduler — two-member async coordination.
 
-Manages the lifecycle of a 1-to-1 meeting between two BNI members:
-  1. Match accepted → ask member_a for availability
-  2. Member_a provides slots → proactively message member_b
-  3. Member_b provides slots → find overlap → propose time
-  4. Both confirm → create reminders
-  5. After meeting → trigger followup
-
-Members are in SEPARATE WhatsApp conversations. Cross-member messaging
-goes through whatsapp_client directly (not through webhook path).
+Moved from services/meeting_scheduler.py — now accepts account parameter
+and uses AsyncDBConnection(tenant_id) instead of ClientDBConnection.
 """
 import json
 import logging
 import uuid
 from datetime import datetime
 
-from db.connection import ClientDBConnection
+from db.connection import AsyncDBConnection
 from services import whatsapp_client
+from services.account_registry import WhatsAppAccount
 
 logger = logging.getLogger(__name__)
 
 
 async def initiate_meeting_from_match(
-    member_a_phone: str, conversation_id: str, lead_id: str
+    member_a_phone: str, conversation_id: str, lead_id: str,
+    account: WhatsAppAccount,
 ):
-    """Create a scheduled_meetings row and set member_a's state to collect availability.
-
-    Called when member_a accepts a match suggestion.
-    """
+    """Create a scheduled_meetings row and set member_a's state to collect availability."""
+    tenant_id = account.tenant_id
     try:
-        # Get match info from member_a's conversation state
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             state = await conn.fetchrow(
-                "SELECT metadata FROM bni_conversation_manager WHERE member_phone = $1",
+                "SELECT metadata FROM conversation_states WHERE phone = $1",
                 member_a_phone,
             )
             if not state:
@@ -58,56 +51,50 @@ async def initiate_meeting_from_match(
                 logger.error("Match info missing phone number")
                 return
 
-            # Create the meeting record
             meeting_id = str(uuid.uuid4())
             await conn.execute(
                 """
                 INSERT INTO scheduled_meetings
                     (id, member_a_phone, member_a_name, member_b_phone, member_b_name,
-                     status, created_at, updated_at)
-                VALUES ($1::uuid, $2, $3, $4, $5, 'pending_a_availability', NOW(), NOW())
+                     status, tenant_id, created_at, updated_at)
+                VALUES ($1::uuid, $2, $3, $4, $5, 'pending_a_availability', $6::uuid, NOW(), NOW())
                 """,
                 meeting_id,
                 member_a_phone,
                 metadata.get("member_name", member_a_phone),
                 member_b_phone,
                 member_b_name,
+                tenant_id,
             )
 
-            # Store meeting_id in member_a's metadata
             await conn.execute(
                 """
-                UPDATE bni_conversation_manager
+                UPDATE conversation_states
                 SET metadata = jsonb_set(
                     COALESCE(metadata, '{}')::jsonb,
                     '{pending_meeting_id}',
                     $1::jsonb
                 ),
                 context_status = 'coordination_a_availability'
-                WHERE member_phone = $2
+                WHERE phone = $2
                 """,
                 json.dumps(meeting_id),
                 member_a_phone,
             )
 
-            logger.info(
-                f"Meeting {meeting_id} initiated: {member_a_phone} <-> {member_b_phone}"
-            )
+            logger.info(f"Meeting {meeting_id} initiated: {member_a_phone} <-> {member_b_phone}")
 
     except Exception as e:
         logger.error(f"Error initiating meeting: {e}", exc_info=True)
 
 
 async def handle_availability_response(
-    phone_number: str, slots: list[dict]
+    phone_number: str, slots: list[dict], account: WhatsAppAccount,
 ) -> str | None:
-    """Process availability slots from a member.
-
-    Returns a status message or None. Triggers cross-member messaging when needed.
-    """
+    """Process availability slots from a member."""
+    tenant_id = account.tenant_id
     try:
-        async with ClientDBConnection() as conn:
-            # Find the active meeting for this member
+        async with AsyncDBConnection(tenant_id) as conn:
             meeting = await conn.fetchrow(
                 """
                 SELECT * FROM scheduled_meetings
@@ -126,7 +113,6 @@ async def handle_availability_response(
             slots_json = json.dumps(slots)
 
             if is_member_a and meeting["status"] == "pending_a_availability":
-                # Member A provided slots → store and message member B
                 await conn.execute(
                     """
                     UPDATE scheduled_meetings
@@ -139,18 +125,16 @@ async def handle_availability_response(
                     meeting_id,
                 )
 
-                # Proactively message member B
                 member_b_phone = meeting["member_b_phone"]
                 member_a_name = meeting["member_a_name"] or phone_number
 
                 await _notify_member_b_for_availability(
-                    member_b_phone, member_a_name, meeting_id
+                    member_b_phone, member_a_name, meeting_id, account
                 )
 
                 return "availability_stored"
 
             elif not is_member_a and meeting["status"] == "pending_b_availability":
-                # Member B provided slots → find overlap
                 await conn.execute(
                     """
                     UPDATE scheduled_meetings
@@ -162,7 +146,6 @@ async def handle_availability_response(
                     meeting_id,
                 )
 
-                # Try to find overlapping time
                 member_a_slots = meeting["member_a_slots"]
                 if isinstance(member_a_slots, str):
                     member_a_slots = json.loads(member_a_slots)
@@ -170,7 +153,6 @@ async def handle_availability_response(
                 overlap = _find_time_overlap(member_a_slots, slots)
 
                 if overlap:
-                    # Propose the overlapping time to both
                     await conn.execute(
                         """
                         UPDATE scheduled_meetings
@@ -182,10 +164,9 @@ async def handle_availability_response(
                         overlap,
                         meeting_id,
                     )
-                    await _propose_time_to_both(meeting, overlap)
+                    await _propose_time_to_both(meeting, overlap, account)
                     return "overlap_found"
                 else:
-                    # No overlap — ask both to try again
                     await conn.execute(
                         """
                         UPDATE scheduled_meetings
@@ -207,11 +188,12 @@ async def handle_availability_response(
 
 
 async def handle_meeting_confirmation(
-    phone_number: str, confirmed: bool
+    phone_number: str, confirmed: bool, account: WhatsAppAccount,
 ) -> str | None:
     """Process meeting time confirmation from a member."""
+    tenant_id = account.tenant_id
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             meeting = await conn.fetchrow(
                 """
                 SELECT * FROM scheduled_meetings
@@ -229,7 +211,6 @@ async def handle_meeting_confirmation(
             is_member_a = meeting["member_a_phone"] == phone_number
 
             if not confirmed:
-                # Reset to collect availability again
                 await conn.execute(
                     """
                     UPDATE scheduled_meetings
@@ -244,7 +225,6 @@ async def handle_meeting_confirmation(
                 )
                 return "declined"
 
-            # Update confirmation flag
             col = "member_a_confirmed" if is_member_a else "member_b_confirmed"
             await conn.execute(
                 f"""
@@ -255,13 +235,11 @@ async def handle_meeting_confirmation(
                 meeting_id,
             )
 
-            # Check if both confirmed
             updated = await conn.fetchrow(
                 "SELECT * FROM scheduled_meetings WHERE id = $1::uuid", meeting_id
             )
 
             if updated["member_a_confirmed"] and updated["member_b_confirmed"]:
-                # Both confirmed → finalize
                 await conn.execute(
                     """
                     UPDATE scheduled_meetings
@@ -273,16 +251,14 @@ async def handle_meeting_confirmation(
                     meeting_id,
                 )
 
-                # Create reminders
-                await _create_meeting_reminders(updated)
+                await _create_meeting_reminders(updated, tenant_id)
 
-                # Update both members' conversation state to idle
                 for ph in [meeting["member_a_phone"], meeting["member_b_phone"]]:
                     await conn.execute(
                         """
-                        UPDATE bni_conversation_manager
+                        UPDATE conversation_states
                         SET context_status = 'idle', updated_at = NOW()
-                        WHERE member_phone = $1
+                        WHERE phone = $1
                         """,
                         ph,
                     )
@@ -297,22 +273,22 @@ async def handle_meeting_confirmation(
 
 
 async def _notify_member_b_for_availability(
-    member_b_phone: str, member_a_name: str, meeting_id: str
+    member_b_phone: str, member_a_name: str, meeting_id: str,
+    account: WhatsAppAccount,
 ):
     """Proactively message member B to collect their availability."""
+    tenant_id = account.tenant_id
     try:
-        # Update member B's conversation state
-        async with ClientDBConnection() as conn:
-            # Ensure member B has a conversation state row
+        async with AsyncDBConnection(tenant_id) as conn:
             existing = await conn.fetchrow(
-                "SELECT id FROM bni_conversation_manager WHERE member_phone = $1",
+                "SELECT id FROM conversation_states WHERE phone = $1",
                 member_b_phone,
             )
 
             if existing:
                 await conn.execute(
                     """
-                    UPDATE bni_conversation_manager
+                    UPDATE conversation_states
                     SET context_status = 'coordination_b_availability',
                         metadata = jsonb_set(
                             COALESCE(metadata, '{}')::jsonb,
@@ -320,7 +296,7 @@ async def _notify_member_b_for_availability(
                             $1::jsonb
                         ),
                         updated_at = NOW()
-                    WHERE member_phone = $2
+                    WHERE phone = $2
                     """,
                     json.dumps(meeting_id),
                     member_b_phone,
@@ -329,23 +305,25 @@ async def _notify_member_b_for_availability(
                 state_id = str(uuid.uuid4())
                 await conn.execute(
                     """
-                    INSERT INTO bni_conversation_manager
-                        (id, member_phone, context_status, metadata, created_at, updated_at)
+                    INSERT INTO conversation_states
+                        (id, phone, context_status, metadata, tenant_id, created_at, updated_at)
                     VALUES ($1::uuid, $2, 'coordination_b_availability',
-                            $3::jsonb, NOW(), NOW())
+                            $3::jsonb, $4::uuid, NOW(), NOW())
                     """,
                     state_id,
                     member_b_phone,
                     json.dumps({"pending_meeting_id": meeting_id}),
+                    tenant_id,
                 )
 
-        # Send WhatsApp message to member B
         message = (
-            f"Hi! {member_a_name} from BNI Rising Phoenix would like to schedule "
+            f"Hi! {member_a_name} from {account.display_name} would like to schedule "
             f"a 1-to-1 meeting with you. Could you share a few time slots that "
             f"work for you this week? (e.g., 'Tuesday 2-4pm, Wednesday 10am-12pm')"
         )
-        await whatsapp_client.send_message(phone_number=member_b_phone, text=message)
+        await whatsapp_client.send_message(
+            phone_number=member_b_phone, text=message, chapter=account
+        )
         logger.info(f"Notified member B ({member_b_phone}) for availability")
 
     except Exception as e:
@@ -355,18 +333,13 @@ async def _notify_member_b_for_availability(
 def _find_time_overlap(
     slots_a: list[dict], slots_b: list[dict]
 ) -> datetime | None:
-    """Find the first overlapping time slot between two members.
-
-    Each slot is expected as {"date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM"}.
-    Returns the proposed meeting datetime or None.
-    """
+    """Find the first overlapping time slot between two members."""
     try:
         for sa in slots_a:
             for sb in slots_b:
                 if sa.get("date") != sb.get("date"):
                     continue
 
-                # Same date — check time overlap
                 a_start = _parse_time(sa["start"])
                 a_end = _parse_time(sa["end"])
                 b_start = _parse_time(sb["start"])
@@ -376,7 +349,6 @@ def _find_time_overlap(
                 overlap_end = min(a_end, b_end)
 
                 if overlap_start < overlap_end:
-                    # There's an overlap — propose the start of the overlap
                     date_str = sa["date"]
                     return datetime.strptime(
                         f"{date_str} {overlap_start}", "%Y-%m-%d %H:%M"
@@ -388,11 +360,10 @@ def _find_time_overlap(
 
 
 def _parse_time(time_str: str) -> str:
-    """Normalize time string to HH:MM format for comparison."""
+    """Normalize time string to HH:MM format."""
     time_str = time_str.strip()
     if len(time_str) <= 5:
         return time_str
-    # Handle "2:00 PM" style
     try:
         dt = datetime.strptime(time_str, "%I:%M %p")
         return dt.strftime("%H:%M")
@@ -400,7 +371,9 @@ def _parse_time(time_str: str) -> str:
         return time_str
 
 
-async def _propose_time_to_both(meeting: dict, proposed_time: datetime):
+async def _propose_time_to_both(
+    meeting: dict, proposed_time: datetime, account: WhatsAppAccount
+):
     """Send proposed meeting time to both members."""
     time_str = proposed_time.strftime("%A, %B %d at %I:%M %p")
 
@@ -412,19 +385,21 @@ async def _propose_time_to_both(meeting: dict, proposed_time: datetime):
             f"Great news! I found a time that works for your 1-to-1 with {other_name}: "
             f"{time_str}. Does this work for you? (Reply 'yes' to confirm or 'no' to reschedule)"
         )
-        await whatsapp_client.send_message(phone_number=phone, text=message)
+        await whatsapp_client.send_message(
+            phone_number=phone, text=message, chapter=account
+        )
 
     logger.info(f"Proposed time {time_str} to both members")
 
 
-async def _create_meeting_reminders(meeting: dict):
+async def _create_meeting_reminders(meeting: dict, tenant_id: str):
     """Create reminder entries for a confirmed meeting."""
     try:
         confirmed_time = meeting["confirmed_time"] or meeting["proposed_time"]
         if not confirmed_time:
             return
 
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             for phone in [meeting["member_a_phone"], meeting["member_b_phone"]]:
                 for reminder_type in ["24h_before", "1h_before"]:
                     reminder_id = str(uuid.uuid4())
@@ -432,14 +407,15 @@ async def _create_meeting_reminders(meeting: dict):
                         """
                         INSERT INTO meeting_reminders
                             (id, meeting_id, member_phone, reminder_type,
-                             scheduled_time, sent, created_at)
-                        VALUES ($1::uuid, $2::uuid, $3, $4, $5, false, NOW())
+                             scheduled_time, sent, tenant_id, created_at)
+                        VALUES ($1::uuid, $2::uuid, $3, $4, $5, false, $6::uuid, NOW())
                         """,
                         reminder_id,
                         str(meeting["id"]),
                         phone,
                         reminder_type,
                         confirmed_time,
+                        tenant_id,
                     )
 
         logger.info(f"Created reminders for meeting {meeting['id']}")
@@ -448,10 +424,10 @@ async def _create_meeting_reminders(meeting: dict):
         logger.error(f"Error creating reminders: {e}", exc_info=True)
 
 
-async def complete_meeting(meeting_id: str):
-    """Mark a meeting as completed (called by followup task)."""
+async def complete_meeting(meeting_id: str, tenant_id: str):
+    """Mark a meeting as completed."""
     try:
-        async with ClientDBConnection() as conn:
+        async with AsyncDBConnection(tenant_id) as conn:
             await conn.execute(
                 """
                 UPDATE scheduled_meetings
