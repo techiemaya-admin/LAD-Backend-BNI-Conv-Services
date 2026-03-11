@@ -1,0 +1,125 @@
+steps:
+  # Step 1: Build Docker image for production
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:$BRANCH_NAME'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+      - '--build-arg'
+      - 'BUILDKIT_INLINE_CACHE=1'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+    id: 'build'
+    timeout: 600s
+
+  # Step 2: Push image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA'
+    id: 'push-sha'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+    id: 'push-latest'
+
+  # Step 3: Deploy to Cloud Run (production)
+  - name: 'gcr.io/cloud-builders/run'
+    args:
+      - 'deploy'
+      - 'bni-conversation-service'
+      - '--image=gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+      - '--memory=512Mi'
+      - '--cpu=2'
+      - '--min-instances=1'
+      - '--max-instances=20'
+      - '--concurrency=80'
+      - '--timeout=300'
+      - '--cpu-boost'
+      - '--set-env-vars=ENVIRONMENT=production'
+    id: 'deploy'
+
+# Build configuration
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  sourceProvenanceHash:
+    - SHA256
+
+# Images to push to Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+
+# Timeout
+timeout: 1800s
+
+# Substitutions
+substitutions:
+  _REGION: 'us-central1'
+  _SERVICE_NAME: 'bni-conversation-service'
+
+# Trigger configuration (applied in Cloud Console)
+# Trigger on: Push to main branch
+# Branch: ^main$
+# Require approval before build: ON
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'bni-conversation-service-production'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/bni-conversation-service:$SHORT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '2'
+      - '--min-instances'
+      - '1'
+      - '--max-instances'
+      - '10'
+      - '--concurrency'
+      - '50'
+      - '--timeout'
+      - '300'
+      - '--cpu-boost'
+      - '--set-env-vars'
+      - 'ENVIRONMENT=production'
+
+images:
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:production'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+tags:
+  - 'gcp-cloud-build'
+  - 'bni-conversation-service'
+  - 'production'
+  - '${SHORT_SHA}'
