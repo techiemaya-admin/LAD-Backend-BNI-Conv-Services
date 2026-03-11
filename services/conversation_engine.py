@@ -493,11 +493,28 @@ def _call_gemini_sync(
     """Synchronous Gemini call (runs in thread pool)."""
     _ensure_gemini_configured()
 
+    # Define expected response schema
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "agent_reply": {
+                "type": "STRING",
+                "description": "The AI assistant's response message to send to the user"
+            },
+            "info_gathering_fields": {
+                "type": "OBJECT",
+                "description": "Structured data extracted from the conversation"
+            }
+        },
+        "required": ["agent_reply", "info_gathering_fields"]
+    }
+
     gmodel = genai.GenerativeModel(
         model,
         generation_config={
             "temperature": 0.3,
             "response_mime_type": "application/json",
+            "response_schema": response_schema,
         },
     )
 
@@ -605,16 +622,50 @@ def _parse_llm_response(response_text: str) -> tuple[str, dict]:
         logger.warning("LLM returned empty response")
         return "", {}
     
+    # First, try to extract JSON from the response (in case of extra text)
+    response_clean = response_text.strip()
+    
+    # Try to find JSON block if response contains other text
+    import re
+    json_match = re.search(r'\{[^{}]*\}', response_clean, re.DOTALL)
+    if json_match and '{' not in response_clean[:10]:  # JSON isn't at the start
+        response_clean = json_match.group(0)
+        logger.info(f"Extracted JSON from response with extra text")
+    
     try:
-        data = json.loads(response_text)
-        agent_reply = data.get("agent_reply", "").strip() if isinstance(data.get("agent_reply"), str) else data.get("agent_reply", "")
+        data = json.loads(response_clean)
+        
+        # Validate response has required fields
+        if not isinstance(data, dict):
+            logger.warning(f"LLM response is not a JSON object: {type(data)}")
+            return response_text.strip(), {"context_status": "idle"}
+        
+        agent_reply = data.get("agent_reply", "")
+        if isinstance(agent_reply, str):
+            agent_reply = agent_reply.strip()
+        else:
+            agent_reply = str(agent_reply) if agent_reply else ""
+            
         info_fields = data.get("info_gathering_fields", {})
+        if not isinstance(info_fields, dict):
+            info_fields = {}
         
         # Log parsing result for debugging
         if not agent_reply:
-            logger.warning(f"LLM returned JSON but agent_reply was empty. Full response: {response_text[:500]}")
+            logger.warning(
+                f"LLM returned JSON with empty/missing agent_reply. "
+                f"Full response: {response_text[:500]}"
+            )
+            # Try to extract some useful content
+            available_keys = list(data.keys())
+            logger.warning(f"Available keys in response: {available_keys}")
         
         return agent_reply, info_fields
+        
     except json.JSONDecodeError as e:
-        logger.warning(f"LLM response was not valid JSON (error: {e}), using as plain text. Response: {response_text[:500]}")
+        logger.warning(
+            f"LLM response not valid JSON (error: {e}). "
+            f"Using as plain text. Response: {response_text[:500]}"
+        )
+        # Return the response as-is, treating it as the agent reply
         return response_text.strip(), {"context_status": "idle"}

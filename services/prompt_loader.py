@@ -20,12 +20,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FALLBACK_PROMPT = (
-    "You are an AI assistant on WhatsApp. "
-    "Answer the person's question helpfully.\n\n"
+    "You are a helpful WhatsApp business assistant.\n"
+    "\n"
+    "CRITICAL INSTRUCTION: You MUST respond with valid JSON. Your response must ALWAYS contain \"agent_reply\" with a non-empty message.\n"
+    "\n"
     "Conversation history:\n{conversation_json}\n\n"
     "Contact info:\n{context_json}\n\n"
-    "Return JSON:\n"
-    '{{\"agent_reply\": \"your answer\", \"info_gathering_fields\": {{\"context_status\": \"active\"}}}}'
+    "IMPORTANT: Always respond with this exact JSON format:\n"
+    '{{"agent_reply": "Your helpful message here", "info_gathering_fields": {{"context_status": "active"}}}}\n\n'
+    "Do NOT include any text outside the JSON object.\n"
+    "The agent_reply field MUST contain a non-empty, helpful response message."
 )
 
 
