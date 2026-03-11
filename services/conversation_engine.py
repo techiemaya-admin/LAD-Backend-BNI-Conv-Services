@@ -84,15 +84,24 @@ async def process_conversation(
 
     # Resolve account and flow
     if account is None:
-        from services.account_registry import get_default_account
-        account = get_default_account()
-        if account is None:
-            logger.error("No account available for conversation processing")
-            return "I'm sorry, I'm having trouble processing your message. Please try again."
+        logger.error(
+            f"[process_conversation] No account provided for phone_number={phone_number}. "
+            "Multi-tenant service requires explicit account parameter. "
+            "Call with: account=get_account_by_tenant_id(tenant_id)"
+        )
+        return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     flow = get_flow(account.conversation_flow_template)
     tenant_id = account.tenant_id
     slug = account.slug
+
+    # Validate LLM configuration
+    if not account.ai_api_key:
+        logger.error(
+            f"[{slug}] Account missing ai_api_key configuration for LLM calls",
+            extra={"phone_number": phone_number, "ai_model": account.ai_model}
+        )
+        return "I'm sorry, the AI service is not properly configured. Please contact support."
 
     # 1. Load or create conversation state
     t0 = _time.time()
@@ -166,23 +175,44 @@ async def process_conversation(
     gemini_model = account.ai_model if "gemini" in (account.ai_model or "").lower() else DEFAULT_GEMINI_MODEL
     openai_model = account.ai_model if "gpt" in (account.ai_model or "").lower() else DEFAULT_OPENAI_MODEL
 
+    logger.info(
+        f"[{slug}] Calling LLM for message from {phone_number}",
+        extra={
+            "message_len": len(message_text),
+            "gemini_model": gemini_model,
+            "openai_model": openai_model,
+            "has_gemini_key": bool(account.ai_api_key and "gemini" in gemini_model.lower()),
+            "context_status": context_status,
+        }
+    )
+
     llm_response = await _call_gemini(
         system_prompt, message_text, phone_number,
         model=gemini_model, api_key=account.ai_api_key,
     )
 
     if llm_response:
-        logger.info(f"[{slug}][TIMING] gemini_api_call: {_time.time()-t0:.3f}s")
+        logger.info(
+            f"[{slug}][TIMING] gemini_api_call: {_time.time()-t0:.3f}s",
+            extra={"response_len": len(llm_response)}
+        )
     else:
         logger.warning(f"[{slug}] Gemini failed, falling back to OpenAI")
         t0 = _time.time()
         llm_response = await _call_openai(
             system_prompt, message_text, phone_number, model=openai_model
         )
-        logger.info(f"[{slug}][TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s")
+        if llm_response:
+            logger.info(
+                f"[{slug}][TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s",
+                extra={"response_len": len(llm_response)}
+            )
 
     if not llm_response:
-        logger.error(f"[{slug}] LLM failed to generate response for {phone_number}")
+        logger.error(
+            f"[{slug}] Both Gemini and OpenAI failed to generate response for {phone_number}",
+            extra={"user_message": message_text[:100]}
+        )
         return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     # 5. Parse response

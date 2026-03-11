@@ -74,13 +74,13 @@ async def receive_personal_whatsapp_message(
     account = None
     if tenant_id:
         account = get_account_by_tenant_id(tenant_id)
+    else:
+        logger.warning("No X-Tenant-ID header provided in personal webhook request")
 
     if not account:
-        account = get_default_account()
-
-    if not account:
-        logger.error("No WhatsApp account found for personal webhook")
-        raise HTTPException(500, "No account configured for this tenant")
+        error_msg = f"No WhatsApp account configured for tenant: {tenant_id or 'unknown'}"
+        logger.error(f"[personal_webhook] {error_msg}")
+        raise HTTPException(500, error_msg)
 
     # Create an augmented account with personal WhatsApp channel metadata.
     # This tells the message handler to route replies through the personal
