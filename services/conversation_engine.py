@@ -84,11 +84,12 @@ async def process_conversation(
 
     # Resolve account and flow
     if account is None:
-        from services.account_registry import get_default_account
-        account = get_default_account()
-        if account is None:
-            logger.error("No account available for conversation processing")
-            return "I'm sorry, I'm having trouble processing your message. Please try again."
+        logger.error(
+            f"[process_conversation] No account provided for phone_number={phone_number}. "
+            "Multi-tenant service requires explicit account parameter. "
+            "Call with: account=get_account_by_tenant_id(tenant_id)"
+        )
+        return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     flow = get_flow(account.conversation_flow_template)
     tenant_id = account.tenant_id

@@ -88,9 +88,10 @@ async def verify_webhook(
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
     """Facebook webhook verification (backward compat — uses default chapter)."""
-    # Try default chapter token first, then env var fallback
+    # Use env var verify token for backward compatibility
+    # Multi-tenant should use /webhook/{slug} endpoint instead
     chapter = get_default_account()
-    verify_token = chapter.whatsapp_verify_token if chapter else _FALLBACK_VERIFY_TOKEN
+    verify_token = _FALLBACK_VERIFY_TOKEN
 
     if hub_mode == "subscribe" and hub_verify_token == verify_token:
         logger.info("Webhook verified (default chapter)")
@@ -105,7 +106,11 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     """Receive incoming WhatsApp messages (backward compat — uses default chapter)."""
     chapter = get_default_account()
     if not chapter:
-        logger.error("No default chapter configured")
+        logger.error(
+            "No default chapter configured. "
+            "Multi-tenant service requires explicit configuration per tenant. "
+            "Use /webhook/{slug} endpoint with slug from social_whatsapp_accounts table."
+        )
         return JSONResponse({"status": "no chapter configured"}, status_code=500)
 
     try:
