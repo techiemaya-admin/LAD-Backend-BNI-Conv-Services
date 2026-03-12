@@ -95,7 +95,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:3004",
-        "https://*.run.app",
+        "https://web.mrlads.com",
+        "https://lad-frontend-develop.run.app",
+        "https://lad-frontend-stage.run.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
