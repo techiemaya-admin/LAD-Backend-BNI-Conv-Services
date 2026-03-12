@@ -181,6 +181,9 @@ async def process_conversation(
         format_args = {
             'conversation_json': conversation_json,
             'context_json': context_json,
+            # Aliases for prompt templates that use different placeholder names
+            'conversation_history': conversation_json,
+            'contact_info': context_json,
             # Backward compat: BNI prompts may still use these
             'member_json': context_json,
             'match_json': json.dumps(metadata.get("match_json", {})),
@@ -253,6 +256,9 @@ async def process_conversation(
     # 6. Update conversation state
     t0 = _time.time()
     new_status = info_fields.get("context_status", context_status)
+    # Auto-advance from greeting to active after the first successful response
+    if context_status == "greeting" and new_status == "greeting":
+        new_status = "active"
     await _update_conversation_state(phone_number, tenant_id, info_fields, new_status, flow)
     logger.info(f"[{slug}][TIMING] update_conversation_state: {_time.time()-t0:.3f}s")
 
@@ -482,6 +488,8 @@ async def _chain_next_phase(
         system_prompt = prompt_template.format(
             conversation_json=conversation_json,
             context_json=context_json,
+            conversation_history=conversation_json,
+            contact_info=context_json,
             member_json=context_json,
             match_json=json.dumps(metadata.get("match_json", {})),
             meeting_json=json.dumps(metadata.get("meeting_json", {})),

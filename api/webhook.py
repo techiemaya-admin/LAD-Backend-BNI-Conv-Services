@@ -23,7 +23,7 @@ from services.account_registry import (
     get_default_account,
     WhatsAppAccount,
 )
-from db.connection import AsyncDBConnection
+from db.connection import AsyncDBConnection, reload_tenant_config
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,9 @@ async def receive_chapter_webhook(
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
 
+    # Ensure tenant configs are loaded before background task runs
+    await reload_tenant_config()
+
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 
@@ -117,6 +120,9 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
         data = await request.json()
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
+
+    # Ensure tenant configs are loaded before background task runs
+    await reload_tenant_config()
 
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})

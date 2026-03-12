@@ -80,7 +80,7 @@ async def send_message(
 
     try:
         client = _get_client()
-        
+
         # Build headers - include auth if we have it
         headers = {"Content-Type": "application/json"}
         
@@ -140,7 +140,7 @@ async def _save_outgoing_message(
                 """
                 INSERT INTO messages (id, conversation_id, lead_id, role, content,
                     message_status, external_message_id, tenant_id, created_at)
-                VALUES ($1::uuid, $2::uuid, $3::uuid, 'AI', $4, 'sent', $5, $6::uuid, NOW())
+                VALUES ($1::uuid, $2::uuid, $3::uuid, 'agent', $4, 'sent', $5, $6::uuid, NOW())
                 """,
                 internal_id, conversation_id, lead_id, content,
                 external_message_id, account.tenant_id,
