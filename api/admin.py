@@ -536,7 +536,7 @@ async def _ensure_tenant_tables(database_url: str, tenant_id: str, flow_template
         # ---- BNI-specific tables (only for BNI flow) ----
         if flow_template == "bni":
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS bni_conversation_manager (
+                CREATE TABLE IF NOT EXISTS member_conversation_manager (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     lead_id UUID,
                     member_phone VARCHAR(50),
@@ -555,8 +555,8 @@ async def _ensure_tenant_tables(database_url: str, tenant_id: str, flow_template
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                CREATE INDEX IF NOT EXISTS idx_bcm_phone ON bni_conversation_manager(member_phone);
-                CREATE INDEX IF NOT EXISTS idx_bcm_tenant ON bni_conversation_manager(tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_mcm_phone ON member_conversation_manager(member_phone);
+                CREATE INDEX IF NOT EXISTS idx_mcm_tenant ON member_conversation_manager(tenant_id);
 
                 CREATE TABLE IF NOT EXISTS scheduled_meetings (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -589,8 +589,8 @@ async def _ensure_tenant_tables(database_url: str, tenant_id: str, flow_template
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_tenant ON meeting_reminders(tenant_id);
 
-                -- Keep legacy bni_prompts for backward compat during migration
-                CREATE TABLE IF NOT EXISTS bni_prompts (
+                -- Prompts table (shared schema across all tenants)
+                CREATE TABLE IF NOT EXISTS prompts (
                     name VARCHAR(100) PRIMARY KEY,
                     prompt_text TEXT NOT NULL,
                     version INTEGER DEFAULT 1,

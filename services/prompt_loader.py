@@ -62,19 +62,6 @@ async def get_prompt(name: str, account: Optional[WhatsAppAccount] = None) -> st
         except Exception as e:
             logger.warning(f"Could not load prompt '{name}' from prompts table: {e}")
 
-        # Try legacy bni_prompts table as fallback during migration
-        try:
-            async with AsyncDBConnection(tenant_id) as conn:
-                row = await conn.fetchrow(
-                    "SELECT prompt_text FROM bni_prompts WHERE name = $1 AND is_active = true",
-                    name,
-                )
-                if row:
-                    logger.debug(f"Loaded prompt '{name}' from legacy bni_prompts table")
-                    return row["prompt_text"]
-        except Exception:
-            pass  # Table may not exist for non-BNI tenants
-
     logger.warning(f"Prompt '{name}' not found — using generic fallback")
     return FALLBACK_PROMPT
 

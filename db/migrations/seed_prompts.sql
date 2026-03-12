@@ -1,10 +1,10 @@
--- Seed all BNI prompts into the bni_prompts table
+-- Seed all BNI prompts into the prompts table
 -- Run this once to populate prompts from code into the DB
 
 -- Clear existing prompts (optional — uncomment if you want a clean slate)
--- DELETE FROM public.bni_prompts;
+-- DELETE FROM public.prompts;
 
-INSERT INTO public.bni_prompts (name, prompt_text, version, is_active)
+INSERT INTO public.prompts (name, prompt_text, version, is_active)
 VALUES
 
 ('ONBOARDING_GREETING',
@@ -306,5 +306,5 @@ Return JSON:
 
 ON CONFLICT (name) DO UPDATE
 SET prompt_text = EXCLUDED.prompt_text,
-    version = bni_prompts.version + 1,
+    version = prompts.version + 1,
     updated_at = now();
