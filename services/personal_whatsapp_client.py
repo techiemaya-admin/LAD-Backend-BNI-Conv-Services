@@ -80,10 +80,24 @@ async def send_message(
 
     try:
         client = _get_client()
+        
+        # Build headers - include auth if we have it
+        headers = {"Content-Type": "application/json"}
+        
+        # For development: use bypass token or dummy token
+        # In production, LAD_backend should have JWT_SECRET configured
+        dev_token = os.getenv("LAD_SERVICE_TOKEN") or os.getenv("JWT_TOKEN")
+        if dev_token:
+            headers["Authorization"] = f"Bearer {dev_token}"
+        else:
+            # Development bypass: use a service account marker
+            # This assumes LAD_backend has dev mode or skips auth for localhost
+            headers["X-Service-Context"] = "conversation-service"
+        
         response = await client.post(
             send_url,
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
         logger.info(f"[{slug}][TIMING] personal_wa_send: {time.time()-t0:.3f}s")
 
