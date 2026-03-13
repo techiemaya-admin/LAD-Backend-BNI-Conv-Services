@@ -20,6 +20,7 @@ from services.whatsapp_client import (
     get_message_templates,
     send_template_message,
 )
+from services.account_registry import get_account_by_tenant_id
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +514,8 @@ async def post_message(
         content = body.get("content", "").strip()
         lead_id = body.get("lead_id")
         phone_number = body.get("phone_number")
+        # Only take over as human_agent if explicitly requested
+        set_human_owner = body.get("set_human_owner", False)
 
         if not content:
             return {"success": False, "error": "Message content is required"}
@@ -529,23 +532,28 @@ async def post_message(
         if not phone_number:
             return {"success": False, "error": "Could not determine recipient phone number"}
 
-        # Send via WhatsApp
+        # Resolve tenant's WhatsApp account for proper credentials
+        account = get_account_by_tenant_id(tenant_id) if tenant_id else None
+
+        # Send via WhatsApp with tenant credentials
         wa_msg_id = await send_whatsapp_message(
             phone_number=phone_number,
             text=content,
             conversation_id=conversation_id,
             lead_id=lead_id,
+            chapter=account,
         )
 
         if not wa_msg_id:
             return {"success": False, "error": "Failed to send WhatsApp message"}
 
-        # Update conversation owner to human agent
-        async with AsyncDBConnection(tenant_id) as conn:
-            await conn.execute(
-                "UPDATE conversations SET owner = 'human_agent', updated_at = NOW() WHERE id = $1::uuid",
-                conversation_id,
-            )
+        # Only switch to human_agent ownership if explicitly requested
+        if set_human_owner:
+            async with AsyncDBConnection(tenant_id) as conn:
+                await conn.execute(
+                    "UPDATE conversations SET owner = 'human_agent', updated_at = NOW() WHERE id = $1::uuid",
+                    conversation_id,
+                )
 
         msg_id = str(uuid.uuid4())
         return {
@@ -554,7 +562,7 @@ async def post_message(
                 "id": msg_id,
                 "conversation_id": conversation_id,
                 "lead_id": lead_id,
-                "role": "human_agent",
+                "role": "human_agent" if set_human_owner else "agent",
                 "content": content,
                 "message_status": "sent",
                 "created_at": None,
