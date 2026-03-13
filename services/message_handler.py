@@ -39,6 +39,14 @@ DEBOUNCE_SECONDS = 1
 _member_locks: Dict[str, asyncio.Lock] = {}
 
 
+def _normalize_owner(owner: str | None) -> str:
+    """Normalize owner values while keeping AI as the safe default."""
+    val = (owner or "").strip().lower()
+    if val in {"human_agent", "human", "human-agent"}:
+        return "human_agent"
+    return "AI"
+
+
 def _get_member_lock(phone: str) -> asyncio.Lock:
     if phone not in _member_locks:
         _member_locks[phone] = asyncio.Lock()
@@ -125,7 +133,7 @@ async def _get_or_create_conversation(lead_id: str, chapter: WhatsAppAccount) ->
             return {
                 "id": str(row["id"]),
                 "lead_id": str(row["lead_id"]),
-                "owner": row["owner"] or "AI",
+                "owner": _normalize_owner(row["owner"]),
             }
 
         conv_id = str(uuid.uuid4())
@@ -240,7 +248,7 @@ async def _prepare_message_context(
 
         if conv_row:
             conv_id = str(conv_row["id"])
-            owner = conv_row["owner"] or "AI"
+            owner = _normalize_owner(conv_row["owner"])
         else:
             conv_id = str(uuid.uuid4())
             owner = "AI"

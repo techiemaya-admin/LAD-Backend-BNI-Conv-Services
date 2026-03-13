@@ -23,16 +23,26 @@ class OwnershipTransferRequest(BaseModel):
     human_agent_id: Optional[str] = None
 
 
+def _normalize_owner_input(raw_owner: str | None) -> str | None:
+    val = (raw_owner or "").strip().lower()
+    if val in {"ai", "agent", "bot"}:
+        return "AI"
+    if val in {"human_agent", "human", "human-agent"}:
+        return "human_agent"
+    return None
+
+
 @router.patch("/ownership")
 async def transfer_ownership(
     request: OwnershipTransferRequest,
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
     """Transfer conversation ownership."""
-    if request.new_owner not in ("AI", "human_agent"):
+    normalized_owner = _normalize_owner_input(request.new_owner)
+    if normalized_owner not in ("AI", "human_agent"):
         raise HTTPException(status_code=400, detail="new_owner must be 'AI' or 'human_agent'")
 
-    if request.new_owner == "human_agent" and not request.human_agent_id:
+    if normalized_owner == "human_agent" and not request.human_agent_id:
         raise HTTPException(status_code=400, detail="human_agent_id required for human_agent ownership")
 
     try:
@@ -50,8 +60,8 @@ async def transfer_ownership(
                 SET owner = $1, human_agent_id = $2, updated_at = CURRENT_TIMESTAMP
                 WHERE id = $3
                 """,
-                request.new_owner,
-                request.human_agent_id if request.new_owner == "human_agent" else None,
+                normalized_owner,
+                request.human_agent_id if normalized_owner == "human_agent" else None,
                 request.conversation_id,
             )
 
@@ -59,7 +69,7 @@ async def transfer_ownership(
             "success": True,
             "data": {
                 "conversation_id": request.conversation_id,
-                "owner": request.new_owner,
+                "owner": normalized_owner,
                 "human_agent_id": request.human_agent_id,
             },
         }
