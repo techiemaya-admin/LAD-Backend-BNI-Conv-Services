@@ -72,6 +72,11 @@ def _get_waba_id_sync(chapter: Optional[ChapterConfig] = None) -> str:
     return _FALLBACK_WABA_ID
 
 
+def _normalize_phone_number(phone_number: str) -> str:
+    """Normalize phone number to WhatsApp Cloud API format (digits only)."""
+    return re.sub(r"\D", "", phone_number or "")
+
+
 async def mark_as_read(message_id: str, chapter: Optional[ChapterConfig] = None) -> None:
     """Mark an incoming message as read (shows blue ticks)."""
     phone_id, token, api_url = _resolve_creds(chapter)
@@ -230,11 +235,15 @@ async def send_message(
     """Send a WhatsApp text message and save to DB."""
     _, _, api_url = _resolve_creds(chapter)
     t0 = time.time()
+    normalized_phone = _normalize_phone_number(phone_number)
+
+    if not normalized_phone:
+        logger.error("WhatsApp send aborted: invalid phone number after normalization", extra={"phone": phone_number})
+        return None
 
     payload = {
         "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": phone_number,
+        "to": normalized_phone,
         "type": "text",
         "text": {"preview_url": False, "body": text},
     }
@@ -257,10 +266,16 @@ async def send_message(
                 )
                 logger.info(f"[{slug}][TIMING] save_outgoing_message_db: {time.time()-t1:.3f}s")
 
-            logger.info(f"[{slug}] Message sent to {phone_number}: {wa_message_id}")
+            logger.info(f"[{slug}] Message sent to {normalized_phone}: {wa_message_id}")
             return wa_message_id
         else:
-            logger.error(f"WhatsApp send failed ({response.status_code}): {response.text}")
+            logger.error(
+                f"WhatsApp send failed ({response.status_code}): {response.text}",
+                extra={
+                    "to": normalized_phone,
+                    "api_url": api_url,
+                },
+            )
             return None
 
     except Exception as e:

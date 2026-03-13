@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from fastapi import APIRouter, Request, BackgroundTasks, Query, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -23,7 +24,7 @@ from services.account_registry import (
     get_default_account,
     WhatsAppAccount,
 )
-from db.connection import AsyncDBConnection
+from db.connection import AsyncDBConnection, reload_tenant_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,19 @@ logger = logging.getLogger(__name__)
 _FALLBACK_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "BNI_Rising_Phoenix_2026")
 
 router = APIRouter(tags=["webhook"])
+
+_LAST_TENANT_CONFIG_REFRESH = 0.0
+_TENANT_CONFIG_REFRESH_INTERVAL_SECONDS = int(os.getenv("TENANT_CONFIG_REFRESH_INTERVAL_SECONDS", "300"))
+
+
+async def _maybe_reload_tenant_config() -> None:
+    """Reload tenant config periodically instead of every webhook call."""
+    global _LAST_TENANT_CONFIG_REFRESH
+    now = time.time()
+    if now - _LAST_TENANT_CONFIG_REFRESH < _TENANT_CONFIG_REFRESH_INTERVAL_SECONDS:
+        return
+    await reload_tenant_config()
+    _LAST_TENANT_CONFIG_REFRESH = now
 
 
 # ====================
@@ -73,6 +87,8 @@ async def receive_chapter_webhook(
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
 
+    # Periodic refresh avoids heavy config DB calls for every incoming message.
+    await _maybe_reload_tenant_config()
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 
@@ -113,6 +129,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
 
+    # Periodic refresh avoids heavy config DB calls for every incoming message.
+    await _maybe_reload_tenant_config()
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 

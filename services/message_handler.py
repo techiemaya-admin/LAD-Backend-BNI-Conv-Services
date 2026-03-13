@@ -171,6 +171,112 @@ async def _update_conversation_timestamp(conv_id: str, chapter: WhatsAppAccount)
         )
 
 
+async def _prepare_message_context(
+    phone_number: str,
+    contact_name: str,
+    message_text: str,
+    external_message_id: str,
+    chapter: WhatsAppAccount,
+) -> tuple[str, str, str, bool]:
+    """Prepare lead/conversation context in one connection.
+
+    Returns: (lead_id, conversation_id, conversation_owner, is_db_duplicate)
+    """
+    msg_hash = hashlib.sha256(f"{phone_number}:{message_text}".encode()).hexdigest()
+
+    async with AsyncDBConnection(chapter.tenant_id) as conn:
+        # 1) Lead
+        lead_row = await conn.fetchrow(
+            "SELECT id, name, phone FROM leads WHERE phone = $1",
+            phone_number,
+        )
+
+        if lead_row:
+            lead_id = str(lead_row["id"])
+        else:
+            lead_id = str(uuid.uuid4())
+            name = contact_name or phone_number
+            await conn.execute(
+                """
+                INSERT INTO leads (id, organization_id, name, phone, channel, status, tenant_id, created_at, updated_at)
+                VALUES ($1::uuid, $2::uuid, $3, $4, 'whatsapp', 'active', $2::uuid, NOW(), NOW())
+                """,
+                lead_id,
+                chapter.tenant_id,
+                name,
+                phone_number,
+            )
+
+        # 2) DB dedup
+        dedup_existing = await conn.fetchval(
+            """
+            SELECT 1 FROM processed_messages
+                        WHERE lead_id = $1 AND message_hash = $2
+              AND processed_at > NOW() - INTERVAL '30 seconds'
+            """,
+            lead_id,
+            msg_hash,
+        )
+        if dedup_existing:
+            return lead_id, "", "AI", True
+
+        await conn.execute(
+            "INSERT INTO processed_messages (lead_id, message_hash, tenant_id) VALUES ($1, $2, $3::uuid)",
+            lead_id,
+            msg_hash,
+            chapter.tenant_id,
+        )
+
+        # 3) Conversation
+        conv_row = await conn.fetchrow(
+            """
+            SELECT id, owner FROM conversations
+            WHERE lead_id = $1::uuid AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            lead_id,
+        )
+
+        if conv_row:
+            conv_id = str(conv_row["id"])
+            owner = conv_row["owner"] or "AI"
+        else:
+            conv_id = str(uuid.uuid4())
+            owner = "AI"
+            await conn.execute(
+                """
+                INSERT INTO conversations (id, lead_id, status, owner, metadata, tenant_id, started_at, updated_at)
+                VALUES ($1::uuid, $2::uuid, 'active', 'AI', '{}', $3::uuid, NOW(), NOW())
+                """,
+                conv_id,
+                lead_id,
+                chapter.tenant_id,
+            )
+
+        # 4) Save incoming + bump timestamp
+        msg_id = str(uuid.uuid4())
+        await conn.execute(
+            """
+            INSERT INTO messages (id, conversation_id, lead_id, role, content,
+                message_status, external_message_id, tenant_id, created_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'lead', $4, 'received', $5, $6::uuid, NOW())
+            """,
+            msg_id,
+            conv_id,
+            lead_id,
+            message_text,
+            external_message_id,
+            chapter.tenant_id,
+        )
+        await conn.execute(
+            "UPDATE conversations SET updated_at = NOW() WHERE id = $1::uuid",
+            conv_id,
+        )
+
+        return lead_id, conv_id, owner, False
+
+
 async def handle_incoming_message(
     phone_number: str,
     message_text: str,
@@ -191,37 +297,25 @@ async def handle_incoming_message(
     if not is_personal:
         asyncio.create_task(whatsapp_client.mark_as_read(external_message_id, chapter=chapter))
 
-    # Step 1: Get or create lead
+    # Step 1-4: Prepare lead/conversation + dedup + save in one DB connection
     t0 = time.time()
-    lead = await _get_or_create_lead(phone_number, contact_name, chapter)
-    lead_id = lead["id"]
-    logger.info(f"[{chapter.slug}][TIMING] get_or_create_lead: {time.time()-t0:.3f}s")
-
-    # Step 2: DB dedup + get/create conversation IN PARALLEL
-    t0 = time.time()
-    dedup_result, conversation = await asyncio.gather(
-        _db_dedup_check(lead_id, message_text, chapter),
-        _get_or_create_conversation(lead_id, chapter),
+    lead_id, conv_id, owner, dedup_result = await _prepare_message_context(
+        phone_number=phone_number,
+        contact_name=contact_name,
+        message_text=message_text,
+        external_message_id=external_message_id,
+        chapter=chapter,
     )
-    logger.info(f"[{chapter.slug}][TIMING] db_dedup+get_conversation (parallel): {time.time()-t0:.3f}s")
+    logger.info(f"[{chapter.slug}][TIMING] db_prepare_context_total: {time.time()-t0:.3f}s")
 
     if dedup_result:
         logger.debug(f"[{chapter.slug}] DB duplicate for lead {lead_id}, skipping")
         return
 
-    conv_id = conversation["id"]
-
-    # Step 3: Save message + update timestamp IN PARALLEL
-    t0 = time.time()
-    await asyncio.gather(
-        _save_incoming_message(conv_id, lead_id, message_text, external_message_id, chapter),
-        _update_conversation_timestamp(conv_id, chapter),
-    )
-    logger.info(f"[{chapter.slug}][TIMING] save_msg+update_timestamp (parallel): {time.time()-t0:.3f}s")
     logger.info(f"[{chapter.slug}][TIMING] pre-debounce total: {time.time()-t_start:.3f}s")
 
     # Check ownership — skip LLM if human agent owns the conversation
-    if conversation["owner"] == "human_agent":
+    if owner == "human_agent":
         logger.info(f"[{chapter.slug}] Human agent owns conversation {conv_id}, skipping AI")
         return
 
