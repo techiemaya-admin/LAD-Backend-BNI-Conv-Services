@@ -6,7 +6,9 @@ lad_dev.social_whatsapp_accounts table. Each account represents
 a client's WhatsApp integration with its own credentials,
 AI model preferences, and conversation flow template.
 
-Replaces chapter_registry.py with generic multi-tenant support.
+A single tenant can have BOTH a business WhatsApp account (Meta Cloud API)
+and a personal WhatsApp account (Baileys bridge). The registry indexes
+accounts by (tenant_id, channel) so each channel resolves independently.
 """
 from __future__ import annotations
 
@@ -24,9 +26,14 @@ _CONFIG_DB_URL = os.getenv(
     os.getenv("AGENT_DB_URL", "postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent"),
 )
 
+# Channel type constants
+CHANNEL_BUSINESS = "business_whatsapp"
+CHANNEL_PERSONAL = "personal_whatsapp"
+
 # In-memory cache
 _accounts_by_slug: dict[str, WhatsAppAccount] = {}
-_accounts_by_tenant: dict[str, WhatsAppAccount] = {}
+_accounts_by_tenant: dict[str, list[WhatsAppAccount]] = {}  # tenant -> [accounts]
+_accounts_by_tenant_channel: dict[tuple[str, str], WhatsAppAccount] = {}  # (tenant, channel) -> account
 _accounts_by_phone_id: dict[str, WhatsAppAccount] = {}
 
 
@@ -47,6 +54,11 @@ class WhatsAppAccount:
     conversation_flow_template: str = "generic"
     status: str = "active"
     metadata: dict = field(default_factory=dict)
+
+    @property
+    def channel_type(self) -> str:
+        """Derive channel type from metadata."""
+        return self.metadata.get("channel", CHANNEL_BUSINESS)
 
     # Backward compat: alias for code that still uses chapter naming
     @property
@@ -100,9 +112,22 @@ def _row_to_account(row) -> WhatsAppAccount:
     )
 
 
+def _index_account(account: WhatsAppAccount, by_slug, by_tenant, by_tenant_channel, by_phone):
+    """Add one account to all index dicts."""
+    by_slug[account.slug] = account
+
+    by_tenant.setdefault(account.tenant_id, []).append(account)
+
+    channel = account.channel_type
+    by_tenant_channel[(account.tenant_id, channel)] = account
+
+    if account.phone_number_id:
+        by_phone[account.phone_number_id] = account
+
+
 async def load_accounts():
     """Load all active WhatsApp accounts from DB into memory cache."""
-    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_phone_id
+    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_tenant_channel, _accounts_by_phone_id
 
     try:
         conn = await asyncpg.connect(_CONFIG_DB_URL)
@@ -111,22 +136,24 @@ async def load_accounts():
         )
         await conn.close()
 
-        by_slug = {}
-        by_tenant = {}
-        by_phone = {}
+        by_slug: dict[str, WhatsAppAccount] = {}
+        by_tenant: dict[str, list[WhatsAppAccount]] = {}
+        by_tenant_channel: dict[tuple[str, str], WhatsAppAccount] = {}
+        by_phone: dict[str, WhatsAppAccount] = {}
 
         for row in rows:
             account = _row_to_account(row)
-            by_slug[account.slug] = account
-            by_tenant[account.tenant_id] = account
-            if account.phone_number_id:
-                by_phone[account.phone_number_id] = account
+            _index_account(account, by_slug, by_tenant, by_tenant_channel, by_phone)
 
         _accounts_by_slug = by_slug
         _accounts_by_tenant = by_tenant
+        _accounts_by_tenant_channel = by_tenant_channel
         _accounts_by_phone_id = by_phone
 
-        logger.info(f"Loaded {len(by_slug)} active WhatsApp accounts: {list(by_slug.keys())}")
+        logger.info(
+            f"Loaded {len(by_slug)} active WhatsApp accounts: {list(by_slug.keys())}. "
+            f"Tenant-channel pairs: {list(by_tenant_channel.keys())}"
+        )
     except Exception as e:
         logger.error(f"Failed to load WhatsApp accounts: {e}")
         # Try loading from legacy chapters table as fallback
@@ -135,7 +162,7 @@ async def load_accounts():
 
 async def _load_from_chapters_fallback():
     """Fallback: load from lad_dev.chapters if social_whatsapp_accounts doesn't exist yet."""
-    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_phone_id
+    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_tenant_channel, _accounts_by_phone_id
 
     try:
         conn = await asyncpg.connect(_CONFIG_DB_URL)
@@ -144,9 +171,10 @@ async def _load_from_chapters_fallback():
         )
         await conn.close()
 
-        by_slug = {}
-        by_tenant = {}
-        by_phone = {}
+        by_slug: dict[str, WhatsAppAccount] = {}
+        by_tenant: dict[str, list[WhatsAppAccount]] = {}
+        by_tenant_channel: dict[tuple[str, str], WhatsAppAccount] = {}
+        by_phone: dict[str, WhatsAppAccount] = {}
 
         for row in rows:
             account = WhatsAppAccount(
@@ -165,13 +193,11 @@ async def _load_from_chapters_fallback():
                 status=row["status"] or "active",
                 metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (dict(row["metadata"]) if row["metadata"] else {}),
             )
-            by_slug[account.slug] = account
-            by_tenant[account.tenant_id] = account
-            if account.phone_number_id:
-                by_phone[account.phone_number_id] = account
+            _index_account(account, by_slug, by_tenant, by_tenant_channel, by_phone)
 
         _accounts_by_slug = by_slug
         _accounts_by_tenant = by_tenant
+        _accounts_by_tenant_channel = by_tenant_channel
         _accounts_by_phone_id = by_phone
 
         logger.warning(f"Loaded {len(by_slug)} accounts from legacy chapters table (fallback)")
@@ -182,13 +208,14 @@ async def _load_from_chapters_fallback():
 
 def _create_fallback_from_env():
     """Raise error if database load fails (multi-tenant requires explicit config)."""
-    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_phone_id
-    
+    global _accounts_by_slug, _accounts_by_tenant, _accounts_by_tenant_channel, _accounts_by_phone_id
+
     # DO NOT create hardcoded fallback - multi-tenant requires explicit DB config
     _accounts_by_slug = {}
     _accounts_by_tenant = {}
+    _accounts_by_tenant_channel = {}
     _accounts_by_phone_id = {}
-    
+
     logger.error(
         "CRITICAL: No WhatsApp accounts loaded from database. "
         "Multi-tenant service requires explicit configuration in lad_dev.social_whatsapp_accounts. "
@@ -207,8 +234,42 @@ def get_account_by_slug(slug: str) -> Optional[WhatsAppAccount]:
 
 
 def get_account_by_tenant_id(tenant_id: str) -> Optional[WhatsAppAccount]:
-    """Look up account by tenant ID."""
-    return _accounts_by_tenant.get(tenant_id)
+    """Look up account by tenant ID.
+
+    If a tenant has multiple accounts (business + personal), returns the
+    business account by default. Use get_account_by_tenant_and_channel()
+    for explicit channel resolution.
+    """
+    accounts = _accounts_by_tenant.get(tenant_id, [])
+    if not accounts:
+        return None
+    # Prefer business account as default
+    for acc in accounts:
+        if acc.channel_type == CHANNEL_BUSINESS:
+            return acc
+    return accounts[0]
+
+
+def get_account_by_tenant_and_channel(
+    tenant_id: str, channel: str,
+) -> Optional[WhatsAppAccount]:
+    """Look up account by tenant ID and channel type.
+
+    This is the preferred lookup when the channel is known (e.g., personal
+    webhook always knows it's personal_whatsapp).
+
+    Falls back to get_account_by_tenant_id if no channel-specific match.
+    """
+    account = _accounts_by_tenant_channel.get((tenant_id, channel))
+    if account:
+        return account
+    # Fallback: tenant may have a single account that handles both channels
+    return get_account_by_tenant_id(tenant_id)
+
+
+def get_accounts_for_tenant(tenant_id: str) -> list[WhatsAppAccount]:
+    """Get all accounts for a tenant (business + personal)."""
+    return list(_accounts_by_tenant.get(tenant_id, []))
 
 
 def get_account_by_phone_number_id(phone_id: str) -> Optional[WhatsAppAccount]:

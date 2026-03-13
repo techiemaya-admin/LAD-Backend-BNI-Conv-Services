@@ -143,7 +143,7 @@ async def get_inactive_leads(
                         cm.chat_summary,
                         (SELECT content FROM messages m WHERE m.lead_id = l.id AND m.role IN ('lead', 'user')
                          ORDER BY m.created_at DESC LIMIT 1) AS last_user_message,
-                        (SELECT content FROM messages m WHERE m.lead_id = l.id AND m.role IN ('AI', 'assistant')
+                        (SELECT content FROM messages m WHERE m.lead_id = l.id AND m.role IN ('AI', 'assistant', 'agent')
                          ORDER BY m.created_at DESC LIMIT 1) AS last_bot_message,
                         EXTRACT(EPOCH FROM (NOW() - COALESCE(
                             (SELECT MAX(m.created_at) FROM messages m WHERE m.lead_id = l.id),

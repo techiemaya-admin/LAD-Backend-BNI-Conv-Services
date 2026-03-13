@@ -351,7 +351,7 @@ async def get_group_messages(
                     "sender_phone": r["sender_phone"],
                     "sender_company": r["sender_company"],
                     "channel": r["channel"],
-                    "is_outgoing": r["role"] in ("assistant", "agent", "system"),
+                    "is_outgoing": r["role"] in ("assistant", "agent", "AI", "system"),
                 })
 
             return {
