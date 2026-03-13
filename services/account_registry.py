@@ -150,9 +150,11 @@ async def load_accounts():
         _accounts_by_tenant_channel = by_tenant_channel
         _accounts_by_phone_id = by_phone
 
+        phone_map = {pid: f"{acc.slug}(tenant={acc.tenant_id[:8]})" for pid, acc in by_phone.items()}
         logger.info(
             f"Loaded {len(by_slug)} active WhatsApp accounts: {list(by_slug.keys())}. "
-            f"Tenant-channel pairs: {list(by_tenant_channel.keys())}"
+            f"Tenant-channel pairs: {list(by_tenant_channel.keys())}. "
+            f"Phone ID map: {phone_map}"
         )
     except Exception as e:
         logger.error(f"Failed to load WhatsApp accounts: {e}")
