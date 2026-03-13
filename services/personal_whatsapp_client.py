@@ -28,7 +28,8 @@ _LAD_BACKEND_URL = os.getenv(
     os.getenv("NEXT_PUBLIC_BACKEND_URL", "http://localhost:3001"),
 )
 
-_PERSONAL_WA_SEND_PATH = "/api/features/personal-whatsapp/send"
+# LAD backend personal WhatsApp feature is mounted at /api/personal-whatsapp/*
+_PERSONAL_WA_SEND_PATH = "/api/personal-whatsapp/send"
 
 # Shared HTTP client
 _http_client: Optional[httpx.AsyncClient] = None
@@ -72,27 +73,33 @@ async def send_message(
     slug = account.slug if account else "personal"
     t0 = time.time()
 
-    payload = {
-        "account_id": personal_account_id,
-        "to": phone_number,
-        "text": text,
-    }
-
     try:
         client = _get_client()
 
-        # Build headers - include auth if we have it
-        headers = {"Content-Type": "application/json"}
-        
-        # For development: use bypass token or dummy token
-        # In production, LAD_backend should have JWT_SECRET configured
-        dev_token = os.getenv("LAD_SERVICE_TOKEN") or os.getenv("JWT_TOKEN")
-        if dev_token:
-            headers["Authorization"] = f"Bearer {dev_token}"
-        else:
-            # Development bypass: use a service account marker
-            # This assumes LAD_backend has dev mode or skips auth for localhost
-            headers["X-Service-Context"] = "conversation-service"
+        # Use service-to-service tenant context so LAD backend auth middleware can
+        # bypass JWT and route request under the correct tenant.
+        headers = {
+            "Content-Type": "application/json",
+            "X-Service-Context": "conversation-service",
+        }
+        if account and account.tenant_id:
+            headers["X-Tenant-ID"] = account.tenant_id
+
+        # Resolve to an active Baileys session when provided account_id is stale
+        # (for example, a DB social account UUID instead of an in-memory session ID).
+        resolved_account_id = await _resolve_active_session_id(
+            client=client,
+            base_url=base_url,
+            requested_account_id=personal_account_id,
+            headers=headers,
+            account=account,
+        )
+
+        payload = {
+            "account_id": resolved_account_id,
+            "to": phone_number,
+            "text": text,
+        }
         
         response = await client.post(
             send_url,
@@ -123,6 +130,64 @@ async def send_message(
     except Exception as e:
         logger.error(f"Error sending personal WA message to {phone_number}: {e}")
         return None
+
+
+async def _resolve_active_session_id(
+    client: httpx.AsyncClient,
+    base_url: str,
+    requested_account_id: str,
+    headers: dict,
+    account: Optional[WhatsAppAccount],
+) -> str:
+    """Resolve a requested account_id to an active personal WhatsApp session ID.
+
+    If the requested ID is not present among currently active sessions, fallback to
+    the first connected tenant session exposed by LAD backend /accounts endpoint.
+    """
+    accounts_url = f"{base_url}/api/personal-whatsapp/accounts"
+    slug = account.slug if account else "personal"
+
+    try:
+        resp = await client.get(accounts_url, headers=headers)
+        if resp.status_code != 200:
+            logger.warning(
+                f"[{slug}] Failed to fetch personal WA accounts for session resolution: "
+                f"HTTP {resp.status_code}"
+            )
+            return requested_account_id
+
+        data = resp.json() if resp.content else {}
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not isinstance(accounts, list) or not accounts:
+            return requested_account_id
+
+        connected = [a for a in accounts if a.get("status") == "connected"]
+        if not connected:
+            return requested_account_id
+
+        # Keep requested ID if it already matches any known session ID.
+        for acc in connected:
+            if requested_account_id in {acc.get("id"), acc.get("gateway_account_id")}:
+                return requested_account_id
+
+        fallback_id = connected[0].get("id")
+        if fallback_id:
+            logger.warning(
+                f"[{slug}] Using active personal WA session fallback",
+                extra={
+                    "requested_account_id": requested_account_id,
+                    "resolved_account_id": fallback_id,
+                    "connected_sessions": len(connected),
+                },
+            )
+            return str(fallback_id)
+    except Exception as e:
+        logger.warning(
+            f"[{slug}] Error resolving active personal WA session id: {e}",
+            exc_info=True,
+        )
+
+    return requested_account_id
 
 
 async def _save_outgoing_message(
