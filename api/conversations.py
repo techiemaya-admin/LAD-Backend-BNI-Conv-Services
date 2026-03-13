@@ -455,16 +455,30 @@ async def list_messages(
     offset: int = Query(0, ge=0),
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
-    """List messages for a conversation."""
+    """List messages for a conversation with pagination.
+    
+    Strategy: Fetch latest messages first (DESC order), then reverse for display.
+    For initial load (offset=0), return the newest messages.
+    For pagination, offset refers to how many messages to skip from the newest.
+    """
     try:
         async with AsyncDBConnection(tenant_id) as conn:
+            # Get total count first
+            count_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS total FROM messages WHERE conversation_id = $1::uuid",
+                conversation_id,
+            )
+            total = count_row["total"] if count_row else 0
+            
+            # With DESC ordering, offset=0 gets the newest messages
+            # No need to calculate offset from total - DESC handles it naturally
             rows = await conn.fetch(
                 """
                 SELECT id, conversation_id, lead_id, role, content,
                        message_status, created_at
                 FROM messages
                 WHERE conversation_id = $1::uuid
-                ORDER BY created_at ASC
+                ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
                 """,
                 conversation_id,
@@ -472,12 +486,9 @@ async def list_messages(
                 offset,
             )
 
-            count_row = await conn.fetchrow(
-                "SELECT COUNT(*) AS total FROM messages WHERE conversation_id = $1::uuid",
-                conversation_id,
-            )
-
-            total = count_row["total"] if count_row else 0
+            # Reverse to maintain chronological order for display (oldest to newest)
+            rows = list(reversed(rows))
+            
             data = []
             for r in rows:
                 data.append({
@@ -490,6 +501,13 @@ async def list_messages(
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 })
 
+            logger.info(
+                f"[messages] conversation={conversation_id[:8]}... total={total} "
+                f"offset={offset} limit={limit} returned={len(data)} "
+                f"first_msg={data[0]['created_at'] if data else 'N/A'} "
+                f"last_msg={data[-1]['created_at'] if data else 'N/A'}"
+            )
+
             return {
                 "success": True,
                 "data": data,
@@ -498,7 +516,7 @@ async def list_messages(
             }
 
     except Exception as e:
-        logger.error(f"Error listing messages: {e}", exc_info=True)
+        logger.error(f"Error listing messages for {conversation_id}: {e}", exc_info=True)
         return {"success": False, "data": [], "total": 0, "has_more": False, "error": str(e)}
 
 

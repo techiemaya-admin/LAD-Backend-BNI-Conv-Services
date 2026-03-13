@@ -21,6 +21,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from services.message_handler import handle_incoming_message
 from services.account_registry import (
     get_account_by_slug,
+    get_account_by_phone_number_id,
     get_default_account,
     WhatsAppAccount,
 )
@@ -119,25 +120,70 @@ async def verify_webhook(
 
 @router.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receive incoming WhatsApp messages (backward compat — uses default chapter)."""
-    chapter = get_default_account()
-    if not chapter:
-        logger.error(
-            "No default chapter configured. "
-            "Multi-tenant service requires explicit configuration per tenant. "
-            "Use /webhook/{slug} endpoint with slug from social_whatsapp_accounts table."
-        )
-        return JSONResponse({"status": "no chapter configured"}, status_code=500)
+    """Receive incoming WhatsApp messages (backward compat — auto-resolves account).
 
+    Tries to resolve the correct account from the payload's phone_number_id
+    (metadata.phone_number_id in the webhook payload). Falls back to default
+    account if resolution fails.
+    """
     try:
         data = await request.json()
     except Exception:
         return JSONResponse({"status": "invalid payload"}, status_code=400)
 
+    # Try to resolve account from payload's phone_number_id
+    chapter = _resolve_account_from_payload(data)
+
+    if not chapter:
+        chapter = get_default_account()
+
+    if not chapter:
+        logger.error(
+            "No chapter configured and could not resolve from payload. "
+            "Use /webhook/{slug} endpoint with slug from social_whatsapp_accounts table."
+        )
+        return JSONResponse({"status": "no chapter configured"}, status_code=500)
+
+    logger.info(
+        f"[webhook] Resolved account: slug={chapter.slug}, "
+        f"tenant={chapter.tenant_id}, phone_id={chapter.phone_number_id}"
+    )
+
     # Periodic refresh avoids heavy config DB calls for every incoming message.
     await _maybe_reload_tenant_config()
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
+
+
+def _resolve_account_from_payload(data: dict) -> WhatsAppAccount | None:
+    """Extract phone_number_id from webhook payload and resolve the account.
+
+    Meta sends this structure:
+    {
+      "entry": [{
+        "changes": [{
+          "value": {
+            "metadata": { "phone_number_id": "569691699566732" },
+            ...
+          }
+        }]
+      }]
+    }
+    """
+    try:
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                phone_id = change.get("value", {}).get("metadata", {}).get("phone_number_id")
+                if phone_id:
+                    account = get_account_by_phone_number_id(str(phone_id))
+                    if account:
+                        logger.info(f"[webhook] Resolved account from phone_number_id={phone_id}: {account.slug}")
+                        return account
+                    else:
+                        logger.warning(f"[webhook] phone_number_id={phone_id} not found in account registry")
+    except Exception as e:
+        logger.error(f"[webhook] Error resolving account from payload: {e}")
+    return None
 
 
 # ====================
