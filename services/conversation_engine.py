@@ -84,15 +84,24 @@ async def process_conversation(
 
     # Resolve account and flow
     if account is None:
-        from services.account_registry import get_default_account
-        account = get_default_account()
-        if account is None:
-            logger.error("No account available for conversation processing")
-            return "I'm sorry, I'm having trouble processing your message. Please try again."
+        logger.error(
+            f"[process_conversation] No account provided for phone_number={phone_number}. "
+            "Multi-tenant service requires explicit account parameter. "
+            "Call with: account=get_account_by_tenant_id(tenant_id)"
+        )
+        return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     flow = get_flow(account.conversation_flow_template)
     tenant_id = account.tenant_id
     slug = account.slug
+
+    # Validate LLM configuration
+    if not account.ai_api_key:
+        logger.error(
+            f"[{slug}] Account missing ai_api_key configuration for LLM calls",
+            extra={"phone_number": phone_number, "ai_model": account.ai_model}
+        )
+        return "I'm sorry, the AI service is not properly configured. Please contact support."
 
     # 1. Load or create conversation state
     t0 = _time.time()
@@ -147,16 +156,43 @@ async def process_conversation(
     logger.info(f"[{slug}][TIMING] get_messages+load_prompt (parallel): {_time.time()-t0:.3f}s")
 
     try:
-        system_prompt = prompt_template.format(
-            conversation_json=conversation_json,
-            context_json=context_json,
+        # Use string.Formatter to safely replace placeholders while preserving
+        # invalid format specifiers in the template
+        import string
+        
+        class SafeFormatter(string.Formatter):
+            def get_field(self, field_name, args, kwargs):
+                if field_name in kwargs:
+                    return kwargs[field_name], field_name
+                # Return the whole placeholder unchanged if not found
+                return f"{{{field_name}}}", field_name
+            
+            def format_field(self, value, format_spec):
+                # If the value is a placeholder, return it as-is
+                if isinstance(value, str) and value.startswith('{'):
+                    return value
+                try:
+                    return super().format_field(value, format_spec)
+                except (ValueError, KeyError):
+                    # Return placeholder with format spec if formatting fails
+                    return f"{{{value}:{format_spec}}}"
+        
+        formatter = SafeFormatter()
+        format_args = {
+            'conversation_json': conversation_json,
+            'context_json': context_json,
+            # Aliases for prompt templates that use different placeholder names
+            'conversation_history': conversation_json,
+            'contact_info': context_json,
             # Backward compat: BNI prompts may still use these
-            member_json=context_json,
-            match_json=json.dumps(metadata.get("match_json", {})),
-            meeting_json=json.dumps(metadata.get("meeting_json", {})),
-            stats_json=json.dumps(metadata.get("stats_json", {})),
-            current_date=datetime.utcnow().strftime("%Y-%m-%d"),
-        )
+            'member_json': context_json,
+            'match_json': json.dumps(metadata.get("match_json", {})),
+            'meeting_json': json.dumps(metadata.get("meeting_json", {})),
+            'stats_json': json.dumps(metadata.get("stats_json", {})),
+            'current_date': datetime.utcnow().strftime("%Y-%m-%d"),
+            'agent_reply': '',  # Legacy placeholder
+        }
+        system_prompt = formatter.vformat(prompt_template, (), format_args)
     except Exception as e:
         logger.error(f"Prompt formatting failed: {e}", exc_info=True)
         return "I'm sorry, I'm having trouble processing your message. Please try again."
@@ -166,23 +202,44 @@ async def process_conversation(
     gemini_model = account.ai_model if "gemini" in (account.ai_model or "").lower() else DEFAULT_GEMINI_MODEL
     openai_model = account.ai_model if "gpt" in (account.ai_model or "").lower() else DEFAULT_OPENAI_MODEL
 
+    logger.info(
+        f"[{slug}] Calling LLM for message from {phone_number}",
+        extra={
+            "message_len": len(message_text),
+            "gemini_model": gemini_model,
+            "openai_model": openai_model,
+            "has_gemini_key": bool(account.ai_api_key and "gemini" in gemini_model.lower()),
+            "context_status": context_status,
+        }
+    )
+
     llm_response = await _call_gemini(
         system_prompt, message_text, phone_number,
         model=gemini_model, api_key=account.ai_api_key,
     )
 
     if llm_response:
-        logger.info(f"[{slug}][TIMING] gemini_api_call: {_time.time()-t0:.3f}s")
+        logger.info(
+            f"[{slug}][TIMING] gemini_api_call: {_time.time()-t0:.3f}s",
+            extra={"response_len": len(llm_response)}
+        )
     else:
         logger.warning(f"[{slug}] Gemini failed, falling back to OpenAI")
         t0 = _time.time()
         llm_response = await _call_openai(
             system_prompt, message_text, phone_number, model=openai_model
         )
-        logger.info(f"[{slug}][TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s")
+        if llm_response:
+            logger.info(
+                f"[{slug}][TIMING] openai_fallback_api_call: {_time.time()-t0:.3f}s",
+                extra={"response_len": len(llm_response)}
+            )
 
     if not llm_response:
-        logger.error(f"[{slug}] LLM failed to generate response for {phone_number}")
+        logger.error(
+            f"[{slug}] Both Gemini and OpenAI failed to generate response for {phone_number}",
+            extra={"user_message": message_text[:100]}
+        )
         return "I'm sorry, I'm having trouble processing your message. Please try again."
 
     # 5. Parse response
@@ -199,6 +256,9 @@ async def process_conversation(
     # 6. Update conversation state
     t0 = _time.time()
     new_status = info_fields.get("context_status", context_status)
+    # Auto-advance from greeting to active after the first successful response
+    if context_status == "greeting" and new_status == "greeting":
+        new_status = "active"
     await _update_conversation_state(phone_number, tenant_id, info_fields, new_status, flow)
     logger.info(f"[{slug}][TIMING] update_conversation_state: {_time.time()-t0:.3f}s")
 
@@ -428,6 +488,8 @@ async def _chain_next_phase(
         system_prompt = prompt_template.format(
             conversation_json=conversation_json,
             context_json=context_json,
+            conversation_history=conversation_json,
+            contact_info=context_json,
             member_json=context_json,
             match_json=json.dumps(metadata.get("match_json", {})),
             meeting_json=json.dumps(metadata.get("meeting_json", {})),

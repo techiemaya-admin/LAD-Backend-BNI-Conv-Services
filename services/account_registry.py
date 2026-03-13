@@ -181,33 +181,19 @@ async def _load_from_chapters_fallback():
 
 
 def _create_fallback_from_env():
-    """Create a fallback account from environment variables (last resort)."""
+    """Raise error if database load fails (multi-tenant requires explicit config)."""
     global _accounts_by_slug, _accounts_by_tenant, _accounts_by_phone_id
-
-    tenant_id = os.getenv("BNI_TENANT_ID", "9ca4012a-2e02-5593-8cc1-fd5bd81483f9")
-    phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-
-    fallback = WhatsAppAccount(
-        id="fallback",
-        tenant_id=tenant_id,
-        slug="rising-phoenix",
-        display_name="BNI Rising Phoenix",
-        phone_number_id=phone_id,
-        access_token=os.getenv("WHATSAPP_ACCESS_TOKEN", ""),
-        business_account_id=os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", ""),
-        verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN", ""),
-        ai_model="gemini-2.5-flash",
-        timezone="Asia/Dubai",
-        conversation_flow_template="bni",
-        status="active",
+    
+    # DO NOT create hardcoded fallback - multi-tenant requires explicit DB config
+    _accounts_by_slug = {}
+    _accounts_by_tenant = {}
+    _accounts_by_phone_id = {}
+    
+    logger.error(
+        "CRITICAL: No WhatsApp accounts loaded from database. "
+        "Multi-tenant service requires explicit configuration in lad_dev.social_whatsapp_accounts. "
+        "Each tenant must have a registered account with slug, credentials, and flow template."
     )
-
-    _accounts_by_slug = {fallback.slug: fallback}
-    _accounts_by_tenant = {fallback.tenant_id: fallback}
-    if phone_id:
-        _accounts_by_phone_id = {phone_id: fallback}
-
-    logger.warning("Using fallback account from environment variables")
 
 
 async def reload_accounts():

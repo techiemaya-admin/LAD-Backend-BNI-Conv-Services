@@ -52,7 +52,7 @@ ON CONFLICT (slug) DO NOTHING;
 
 -- =============================================
 -- 2. Per-tenant generic table: conversation_states
---    (replaces bni_conversation_manager)
+--    (replaces member_conversation_manager)
 --    Run this in EACH tenant's database.
 -- =============================================
 

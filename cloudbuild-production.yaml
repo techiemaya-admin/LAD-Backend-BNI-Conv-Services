@@ -1,0 +1,119 @@
+steps:
+  # Create lowercase branch name for GCP labels (which require lowercase)
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "${BRANCH_NAME,,}" > /workspace/branch_lower.txt
+        cat /workspace/branch_lower.txt
+
+  # Build the Docker image with buildkit for better caching
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA',
+      '-t', 'gcr.io/$PROJECT_ID/bni-conversation-service:$SHORT_SHA',
+      '-t', 'gcr.io/$PROJECT_ID/bni-conversation-service:$BRANCH_NAME',
+      '-t', 'gcr.io/$PROJECT_ID/bni-conversation-service:latest',
+      '--cache-from', 'gcr.io/$PROJECT_ID/bni-conversation-service:latest',
+      '--build-arg', 'BUILDKIT_INLINE_CACHE=1',
+      '.'
+    ]
+    timeout: 600s
+
+  # Push the Docker images to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/bni-conversation-service:$SHORT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/bni-conversation-service:$BRANCH_NAME']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/bni-conversation-service:latest']
+
+  # Deploy to Cloud Run with automatic deployment for production branch
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        echo "========================================"
+        echo "Starting Cloud Run deployment..."
+        echo "Service: $_SERVICE_NAME"
+        echo "Region: $_REGION"
+        echo "Image: gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA"
+        echo "========================================"
+        
+        BRANCH_LOWER=$(cat /workspace/branch_lower.txt)
+        
+        # Create env vars file to handle special characters properly
+        cat > /workspace/env-vars.yaml <<EOF
+        BNI_DB_URL: "$_BNI_DB_URL"
+        AGENT_DB_URL: "$_AGENT_DB_URL"
+        BNI_TENANT_ID: "$_BNI_TENANT_ID"
+        ENVIRONMENT: "production"
+        BRANCH: "$BRANCH_NAME"
+        COMMIT_SHA: "$SHORT_SHA"
+        BUILD_ID: "$BUILD_ID"
+        EOF
+        
+        echo "Env vars file created:"
+        cat /workspace/env-vars.yaml
+        echo ""
+        
+        gcloud run deploy $_SERVICE_NAME \
+          --image gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA \
+          --region $_REGION \
+          --platform managed \
+          --allow-unauthenticated \
+          --memory 512Mi \
+          --cpu 2 \
+          --min-instances 1 \
+          --max-instances 20 \
+          --concurrency 80 \
+          --timeout 300 \
+          --cpu-boost \
+          --port 8080 \
+          --env-vars-file /workspace/env-vars.yaml \
+          --update-labels branch=$${BRANCH_LOWER},commit-sha=$SHORT_SHA,managed-by=cloud-build
+        
+        echo "========================================"
+        echo "✓ Deployment completed successfully!"
+        echo "========================================"
+
+# Build configuration
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  sourceProvenanceHash:
+    - SHA256
+
+# Images to push to Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:$BRANCH_NAME'
+  - 'gcr.io/$PROJECT_ID/bni-conversation-service:latest'
+
+# Timeout
+timeout: 1800s
+
+# Substitutions
+substitutions:
+  _REGION: 'us-central1'
+  _SERVICE_NAME: 'bni-conversation-service'
+  _BNI_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_bni'
+  _AGENT_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent'
+  _BNI_TENANT_ID: '9ca4012a-2e02-5593-8cc1-fd5bd81483f9'
+
+# Trigger configuration (applied in Cloud Console)
+# Trigger on: Push to main branch
+# Branch: ^main$
+# Require approval before build: ON
+# SECURITY: In production, migrate credentials to Google Secret Manager instead of hardcoding
+# See: https://cloud.google.com/build/docs/securing-builds/use-secrets

@@ -171,6 +171,27 @@ async def _save_incoming_message(
         )
 
 
+async def _save_outgoing_message(
+    conversation_id: str, lead_id: str, content: str,
+    chapter: WhatsAppAccount,
+):
+    """Save outgoing agent message to DB."""
+    msg_id = str(uuid.uuid4())
+    async with AsyncDBConnection(chapter.tenant_id) as conn:
+        await conn.execute(
+            """
+            INSERT INTO messages (id, conversation_id, lead_id, role, content,
+                message_status, tenant_id, created_at)
+            VALUES ($1::uuid, $2::uuid, $3::uuid, 'agent', $4, 'sent', $5::uuid, NOW())
+            """,
+            msg_id,
+            conversation_id,
+            lead_id,
+            content,
+            chapter.tenant_id,
+        )
+
+
 async def _update_conversation_timestamp(conv_id: str, chapter: WhatsAppAccount):
     """Update conversation's last activity timestamp."""
     async with AsyncDBConnection(chapter.tenant_id) as conn:
@@ -365,6 +386,11 @@ async def _flush_buffer(
     lock = _get_member_lock(phone_number)
     async with lock:
         try:
+            logger.info(
+                f"[{chapter.slug}] Processing {len(combined)} chars from {phone_number}",
+                extra={"lead_id": lead_id, "conv_id": conv_id}
+            )
+            
             t_llm = time.time()
             reply = await process_conversation(
                 phone_number=phone_number,
@@ -376,19 +402,47 @@ async def _flush_buffer(
             )
             logger.info(f"[{chapter.slug}][TIMING] process_conversation (LLM pipeline): {time.time()-t_llm:.3f}s")
 
-            if reply:
-                t_wa = time.time()
-                await _send_reply(
-                    phone_number=phone_number,
-                    text=reply,
-                    conversation_id=conv_id,
-                    lead_id=lead_id,
-                    chapter=chapter,
+            if not reply:
+                logger.warning(
+                    f"[{chapter.slug}] LLM returned empty response for {phone_number}",
+                    extra={"lead_id": lead_id}
                 )
-                logger.info(f"[{chapter.slug}][TIMING] whatsapp_send: {time.time()-t_wa:.3f}s")
+                # Don't send error message — just log and continue
+                return
+
+            logger.info(
+                f"[{chapter.slug}] AI Reply ready ({len(reply)} chars): {reply[:100]}...",
+                extra={"phone_number": phone_number}
+            )
+            
+            # Save agent response to database
+            await _save_outgoing_message(
+                conversation_id=conv_id,
+                lead_id=lead_id,
+                content=reply,
+                chapter=chapter,
+            )
+            
+            t_wa = time.time()
+            sent = await _send_reply(
+                phone_number=phone_number,
+                text=reply,
+                conversation_id=conv_id,
+                lead_id=lead_id,
+                chapter=chapter,
+            )
+            logger.info(f"[{chapter.slug}][TIMING] whatsapp_send: {time.time()-t_wa:.3f}s, sent: {sent}")
+            
+            if not sent:
+                logger.error(
+                    f"[{chapter.slug}] Failed to send reply to {phone_number}",
+                    extra={"reply_text": reply[:50]}
+                )
         except Exception as e:
             logger.error(
-                f"[{chapter.slug}] Error processing message for {phone_number}: {e}", exc_info=True
+                f"[{chapter.slug}] Error processing message for {phone_number}: {e}", 
+                exc_info=True,
+                extra={"lead_id": lead_id}
             )
 
 
@@ -398,31 +452,88 @@ async def _send_reply(
     conversation_id: str,
     lead_id: str,
     chapter: WhatsAppAccount,
-):
+) -> bool:
     """Route reply to the correct channel client.
 
     For personal WhatsApp (Baileys), sends via LAD_backend.
     For business WhatsApp (Cloud API), sends via Meta Graph API.
+    
+    Returns:
+        True if message was sent successfully, False otherwise.
     """
     channel = chapter.metadata.get("channel", "business_whatsapp")
+    slug = chapter.slug
 
-    if channel == "personal_whatsapp":
-        personal_account_id = chapter.metadata.get("personal_account_id", "")
-        lad_backend_url = chapter.metadata.get("lad_backend_url") or None
-        await personal_whatsapp_client.send_message(
-            phone_number=phone_number,
-            text=text,
-            personal_account_id=personal_account_id,
-            conversation_id=conversation_id,
-            lead_id=lead_id,
-            account=chapter,
-            lad_backend_url=lad_backend_url,
+    try:
+        if channel == "personal_whatsapp":
+            personal_account_id = chapter.metadata.get("personal_account_id", "")
+            lad_backend_url = chapter.metadata.get("lad_backend_url") or None
+            
+            if not personal_account_id:
+                logger.error(
+                    f"[{slug}] Missing personal_account_id in metadata for personal WhatsApp channel",
+                    extra={"phone_number": phone_number}
+                )
+                return False
+            
+            logger.info(
+                f"[{slug}] Sending via personal WhatsApp channel",
+                extra={"account_id": personal_account_id, "to": phone_number}
+            )
+            
+            gateway_msg_id = await personal_whatsapp_client.send_message(
+                phone_number=phone_number,
+                text=text,
+                personal_account_id=personal_account_id,
+                conversation_id=conversation_id,
+                lead_id=lead_id,
+                account=chapter,
+                lad_backend_url=lad_backend_url,
+            )
+            
+            if gateway_msg_id:
+                logger.info(
+                    f"[{slug}] Personal WhatsApp message sent successfully",
+                    extra={"msg_id": gateway_msg_id, "to": phone_number}
+                )
+                return True
+            else:
+                logger.error(
+                    f"[{slug}] Personal WhatsApp send returned no message ID",
+                    extra={"to": phone_number, "text_len": len(text)}
+                )
+                return False
+        else:
+            logger.info(
+                f"[{slug}] Sending via business WhatsApp channel",
+                extra={"to": phone_number}
+            )
+            
+            gateway_msg_id = await whatsapp_client.send_message(
+                phone_number=phone_number,
+                text=text,
+                conversation_id=conversation_id,
+                lead_id=lead_id,
+                chapter=chapter,
+            )
+            
+            if gateway_msg_id:
+                logger.info(
+                    f"[{slug}] Business WhatsApp message sent successfully",
+                    extra={"msg_id": gateway_msg_id}
+                )
+                return True
+            else:
+                logger.error(
+                    f"[{slug}] Business WhatsApp send returned no message ID",
+                    extra={"to": phone_number}
+                )
+                return False
+                
+    except Exception as e:
+        logger.error(
+            f"[{slug}] Exception sending reply to {phone_number}: {e}",
+            exc_info=True,
+            extra={"channel": channel}
         )
-    else:
-        await whatsapp_client.send_message(
-            phone_number=phone_number,
-            text=text,
-            conversation_id=conversation_id,
-            lead_id=lead_id,
-            chapter=chapter,
-        )
+        return False

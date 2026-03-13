@@ -33,13 +33,13 @@ ALTER TABLE messages ALTER COLUMN tenant_id SET DEFAULT '9ca4012a-2e02-5593-8cc1
 CREATE INDEX IF NOT EXISTS idx_messages_tenant_id ON messages (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_messages_tenant_conversation ON messages (tenant_id, conversation_id);
 
--- 4. bni_conversation_manager
-ALTER TABLE bni_conversation_manager ADD COLUMN IF NOT EXISTS tenant_id UUID;
-UPDATE bni_conversation_manager SET tenant_id = '9ca4012a-2e02-5593-8cc1-fd5bd81483f9' WHERE tenant_id IS NULL;
-ALTER TABLE bni_conversation_manager ALTER COLUMN tenant_id SET NOT NULL;
-ALTER TABLE bni_conversation_manager ALTER COLUMN tenant_id SET DEFAULT '9ca4012a-2e02-5593-8cc1-fd5bd81483f9';
-CREATE INDEX IF NOT EXISTS idx_bni_cm_tenant_id ON bni_conversation_manager (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_bni_cm_tenant_phone ON bni_conversation_manager (tenant_id, member_phone);
+-- 4. member_conversation_manager
+ALTER TABLE member_conversation_manager ADD COLUMN IF NOT EXISTS tenant_id UUID;
+UPDATE member_conversation_manager SET tenant_id = '9ca4012a-2e02-5593-8cc1-fd5bd81483f9' WHERE tenant_id IS NULL;
+ALTER TABLE member_conversation_manager ALTER COLUMN tenant_id SET NOT NULL;
+ALTER TABLE member_conversation_manager ALTER COLUMN tenant_id SET DEFAULT '9ca4012a-2e02-5593-8cc1-fd5bd81483f9';
+CREATE INDEX IF NOT EXISTS idx_mcm_tenant_id ON member_conversation_manager (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_mcm_tenant_phone ON member_conversation_manager (tenant_id, member_phone);
 
 -- 5. scheduled_meetings
 ALTER TABLE scheduled_meetings ADD COLUMN IF NOT EXISTS tenant_id UUID;
