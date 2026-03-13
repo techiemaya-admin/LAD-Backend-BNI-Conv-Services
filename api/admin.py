@@ -15,13 +15,15 @@ import os
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from db.connection import CoreDBConnection, reload_tenant_config
+from middleware.tenant import get_tenant_id
 from services.account_registry import (
     reload_accounts as reload_chapters,
     get_all_active_accounts as get_all_active_chapters,
+    get_accounts_for_tenant,
     get_account_by_slug as get_chapter_by_slug,
 )
 
@@ -80,9 +82,13 @@ ChapterUpdateRequest = WhatsAppAccountUpdateRequest
 
 @router.get("/whatsapp-accounts")
 @router.get("/chapters")  # backward compat
-async def list_accounts():
-    """List all registered WhatsApp accounts."""
-    accounts = get_all_active_chapters()
+async def list_accounts(tenant_id: Optional[str] = Depends(get_tenant_id)):
+    """List WhatsApp accounts, filtered to the current tenant when X-Tenant-ID is present."""
+    if tenant_id:
+        accounts = get_accounts_for_tenant(tenant_id)
+    else:
+        accounts = get_all_active_chapters()
+
     return {
         "success": True,
         "data": [
