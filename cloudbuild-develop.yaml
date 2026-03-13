@@ -59,6 +59,7 @@ steps:
         BRANCH: "$BRANCH_NAME"
         COMMIT_SHA: "$SHORT_SHA"
         BUILD_ID: "$BUILD_ID"
+        LAD_BACKEND_URL: "$_LAD_BACKEND_URL"
         EOF
         
         echo "Env vars file created:"
@@ -108,6 +109,7 @@ substitutions:
   _BNI_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_bni'
   _AGENT_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent'
   _BNI_TENANT_ID: '9ca4012a-2e02-5593-8cc1-fd5bd81483f9'
+  _LAD_BACKEND_URL: 'https://lad-backend-develop-160078175457.us-central1.run.app'
 
 # Trigger configuration (applied in Cloud Console)
 # Trigger on: Push to develop branch

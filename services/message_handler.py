@@ -23,7 +23,7 @@ from db.connection import AsyncDBConnection
 from services.conversation_engine import process_conversation
 from services import whatsapp_client
 from services import personal_whatsapp_client
-from services.account_registry import WhatsAppAccount
+from services.account_registry import WhatsAppAccount, CHANNEL_BUSINESS, CHANNEL_PERSONAL
 
 logger = logging.getLogger(__name__)
 
@@ -256,11 +256,19 @@ async def _prepare_message_context(
             chapter.tenant_id,
         )
 
-        # 3) Conversation
+        # 3) Conversation — scoped by channel so the same lead gets separate
+        #    conversations for business vs personal WhatsApp.
+        channel = chapter.metadata.get("channel", CHANNEL_BUSINESS)
+        # Legacy rows have channel='whatsapp' or NULL — treat as business_whatsapp
+        if channel == CHANNEL_PERSONAL:
+            channel_filter = "AND channel = 'personal_whatsapp'"
+        else:
+            channel_filter = "AND COALESCE(channel, 'whatsapp') IN ('whatsapp', 'business_whatsapp')"
         conv_row = await conn.fetchrow(
-            """
+            f"""
             SELECT id, owner FROM conversations
             WHERE lead_id = $1::uuid AND status = 'active'
+              {channel_filter}
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -275,11 +283,12 @@ async def _prepare_message_context(
             owner = "AI"
             await conn.execute(
                 """
-                INSERT INTO conversations (id, lead_id, status, owner, metadata, tenant_id, started_at, updated_at)
-                VALUES ($1::uuid, $2::uuid, 'active', 'AI', '{}', $3::uuid, NOW(), NOW())
+                INSERT INTO conversations (id, lead_id, channel, status, owner, metadata, tenant_id, started_at, updated_at)
+                VALUES ($1::uuid, $2::uuid, $3, 'active', 'AI', '{}', $4::uuid, NOW(), NOW())
                 """,
                 conv_id,
                 lead_id,
+                channel,
                 chapter.tenant_id,
             )
 
@@ -348,11 +357,16 @@ async def handle_incoming_message(
         logger.info(f"[{chapter.slug}] Human agent owns conversation {conv_id}, skipping AI")
         return
 
-    # Debounce: buffer messages per member, flush after 1s of silence
-    if phone_number not in _member_buffers:
-        _member_buffers[phone_number] = {"messages": [], "task": None, "chapter": chapter}
+    # Debounce: buffer messages per member+channel, flush after 1s of silence.
+    # Include channel in key so the same phone on personal vs business WA
+    # doesn't collide in the buffer.
+    channel = chapter.metadata.get("channel", CHANNEL_BUSINESS)
+    buffer_key = f"{phone_number}:{channel}"
 
-    buf = _member_buffers[phone_number]
+    if buffer_key not in _member_buffers:
+        _member_buffers[buffer_key] = {"messages": [], "task": None, "chapter": chapter}
+
+    buf = _member_buffers[buffer_key]
     buf["messages"].append(message_text)
     buf["chapter"] = chapter  # Update chapter ref
 
@@ -362,13 +376,13 @@ async def handle_incoming_message(
 
     # Schedule new flush
     buf["task"] = asyncio.create_task(
-        _flush_buffer(phone_number, lead_id, conv_id, contact_name, chapter)
+        _flush_buffer(buffer_key, phone_number, lead_id, conv_id, contact_name, chapter)
     )
 
 
 async def _flush_buffer(
-    phone_number: str, lead_id: str, conv_id: str, contact_name: str,
-    chapter: WhatsAppAccount,
+    buffer_key: str, phone_number: str, lead_id: str, conv_id: str,
+    contact_name: str, chapter: WhatsAppAccount,
 ):
     """Wait for debounce period, then process combined messages."""
     try:
@@ -376,14 +390,14 @@ async def _flush_buffer(
     except asyncio.CancelledError:
         return
 
-    buf = _member_buffers.get(phone_number)
+    buf = _member_buffers.get(buffer_key)
     if not buf or not buf["messages"]:
         return
 
     combined = " ".join(buf["messages"])
     buf["messages"].clear()
 
-    lock = _get_member_lock(phone_number)
+    lock = _get_member_lock(buffer_key)
     async with lock:
         try:
             logger.info(
@@ -414,15 +428,7 @@ async def _flush_buffer(
                 f"[{chapter.slug}] AI Reply ready ({len(reply)} chars): {reply[:100]}...",
                 extra={"phone_number": phone_number}
             )
-            
-            # Save agent response to database
-            await _save_outgoing_message(
-                conversation_id=conv_id,
-                lead_id=lead_id,
-                content=reply,
-                chapter=chapter,
-            )
-            
+
             t_wa = time.time()
             sent = await _send_reply(
                 phone_number=phone_number,

@@ -24,8 +24,8 @@ from fastapi import APIRouter, Request, BackgroundTasks, HTTPException, Depends
 
 from services.message_handler import handle_incoming_message
 from services.account_registry import (
-    get_account_by_tenant_id,
-    get_default_account,
+    get_account_by_tenant_and_channel,
+    CHANNEL_PERSONAL,
     WhatsAppAccount,
 )
 from middleware.tenant import get_tenant_id
@@ -70,10 +70,12 @@ async def receive_personal_whatsapp_message(
     if not external_message_id:
         raise HTTPException(400, "external_message_id is required")
 
-    # Resolve tenant's WhatsApp account config (for AI model, flow template, etc.)
+    # Resolve tenant's personal WhatsApp account config.
+    # Use channel-aware lookup so we get the personal-specific account
+    # even when the tenant also has a business account.
     account = None
     if tenant_id:
-        account = get_account_by_tenant_id(tenant_id)
+        account = get_account_by_tenant_and_channel(tenant_id, CHANNEL_PERSONAL)
     else:
         logger.warning("No X-Tenant-ID header provided in personal webhook request")
 
@@ -82,9 +84,10 @@ async def receive_personal_whatsapp_message(
         logger.error(f"[personal_webhook] {error_msg}")
         raise HTTPException(500, error_msg)
 
-    # Create an augmented account with personal WhatsApp channel metadata.
-    # This tells the message handler to route replies through the personal
-    # WhatsApp client instead of the Meta Cloud API.
+    # Ensure personal channel metadata is set on the account.
+    # If the account was already configured as personal in the DB, its metadata
+    # already has channel=personal_whatsapp. We still inject the runtime fields
+    # (personal_account_id, lad_backend_url) from the incoming request.
     personal_metadata = {
         **account.metadata,
         "channel": "personal_whatsapp",

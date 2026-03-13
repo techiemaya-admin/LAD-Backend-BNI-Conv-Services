@@ -483,7 +483,7 @@ async def list_messages(
                     "id": str(r["id"]),
                     "conversation_id": str(r["conversation_id"]),
                     "lead_id": str(r["lead_id"]),
-                    "role": "assistant" if r["role"] == "agent" else ("user" if r["role"] == "lead" else r["role"]),
+                    "role": "assistant" if r["role"] in ("agent", "AI") else ("user" if r["role"] == "lead" else r["role"]),
                     "content": r["content"],
                     "message_status": r["message_status"] or "sent",
                     "created_at": r["created_at"].isoformat() if r["created_at"] else None,
