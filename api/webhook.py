@@ -89,7 +89,6 @@ async def receive_chapter_webhook(
 
     # Periodic refresh avoids heavy config DB calls for every incoming message.
     await _maybe_reload_tenant_config()
-
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 
@@ -137,7 +136,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # Periodic refresh avoids heavy config DB calls for every incoming message.
     await _maybe_reload_tenant_config()
-
     background_tasks.add_task(process_webhook_payload, data, chapter)
     return JSONResponse({"status": "accepted"})
 

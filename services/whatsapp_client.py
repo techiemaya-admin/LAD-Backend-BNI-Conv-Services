@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+import json
 from typing import Optional
 
 import httpx
@@ -269,12 +270,69 @@ async def send_message(
             logger.info(f"[{slug}] Message sent to {normalized_phone}: {wa_message_id}")
             return wa_message_id
         else:
+            # Retry with a minimal payload if Meta rejects a parameter.
+            # This helps isolate fields like preview_url that can be account-version sensitive.
+            retry_response = None
+            error_code = None
+            error_details = ""
+            try:
+                err_json = response.json()
+                error_code = err_json.get("error", {}).get("code")
+                error_details = err_json.get("error", {}).get("error_data", {}).get("details", "")
+            except Exception:
+                err_json = None
+
+            if response.status_code == 400 and error_code == 100:
+                minimal_payload = {
+                    "messaging_product": "whatsapp",
+                    "to": normalized_phone,
+                    "type": "text",
+                    "text": {"body": text},
+                }
+
+                retry_t0 = time.time()
+                retry_response = await client.post(
+                    api_url,
+                    headers=_get_headers(chapter),
+                    json=minimal_payload,
+                )
+                logger.info(
+                    f"[{slug}][TIMING] whatsapp_api_post_retry_minimal: {time.time()-retry_t0:.3f}s"
+                )
+
+                if retry_response.status_code in (200, 201):
+                    resp_data = retry_response.json()
+                    wa_message_id = resp_data.get("messages", [{}])[0].get("id", "")
+                    internal_id = str(uuid.uuid4())
+
+                    if conversation_id and lead_id:
+                        t1 = time.time()
+                        await _save_outgoing_message(
+                            internal_id, wa_message_id, conversation_id, lead_id, text, chapter
+                        )
+                        logger.info(f"[{slug}][TIMING] save_outgoing_message_db: {time.time()-t1:.3f}s")
+
+                    logger.info(
+                        f"[{slug}] Message sent on minimal retry to {normalized_phone}: {wa_message_id}"
+                    )
+                    return wa_message_id
+
+            log_extra = {
+                "to": normalized_phone,
+                "api_url": api_url,
+                "text_len": len(text),
+                "error_code": error_code,
+                "error_details": error_details,
+            }
+            if err_json is not None:
+                log_extra["error_json"] = json.dumps(err_json)
+            if retry_response is not None:
+                log_extra["retry_status"] = retry_response.status_code
+                log_extra["retry_body"] = retry_response.text
+
             logger.error(
                 f"WhatsApp send failed ({response.status_code}): {response.text}",
-                extra={
-                    "to": normalized_phone,
-                    "api_url": api_url,
-                },
+                extra=log_extra,
             )
             return None
 

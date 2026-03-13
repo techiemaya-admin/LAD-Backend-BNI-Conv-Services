@@ -26,6 +26,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
+def _normalize_owner_input(raw_owner: str | None) -> str | None:
+    val = (raw_owner or "").strip().lower()
+    if val in {"ai", "agent", "bot"}:
+        return "AI"
+    if val in {"human_agent", "human", "human-agent"}:
+        return "human_agent"
+    return None
+
+
 # ── Pydantic models ──────────────────────────────────────────────
 
 class BulkStatusRequest(BaseModel):
@@ -646,7 +655,7 @@ async def update_ownership(
     """Update conversation ownership (AI, human_agent)."""
     try:
         body = await request.json()
-        new_owner = body.get("owner")
+        new_owner = _normalize_owner_input(body.get("owner"))
         if new_owner not in ("AI", "human_agent"):
             return {"success": False, "error": "Invalid owner"}
 

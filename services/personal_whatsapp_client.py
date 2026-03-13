@@ -100,7 +100,6 @@ async def send_message(
             "to": phone_number,
             "text": text,
         }
-        
         response = await client.post(
             send_url,
             json=payload,
