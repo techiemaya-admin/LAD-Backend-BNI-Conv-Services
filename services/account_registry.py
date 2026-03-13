@@ -83,7 +83,7 @@ class WhatsAppAccount:
 
     @property
     def whatsapp_api_url(self) -> str:
-        return f"https://graph.facebook.com/v21.0/{self.phone_number_id}/messages"
+        return f"https://graph.facebook.com/v22.0/{self.phone_number_id}/messages"
 
     @property
     def whatsapp_headers(self) -> dict:

@@ -54,7 +54,7 @@ def _resolve_creds(chapter: Optional[ChapterConfig] = None) -> tuple[str, str, s
         phone_id = _FALLBACK_PHONE_NUMBER_ID
         token = _FALLBACK_ACCESS_TOKEN
 
-    api_url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
+    api_url = f"https://graph.facebook.com/v22.0/{phone_id}/messages"
     return phone_id, token, api_url
 
 
@@ -109,7 +109,7 @@ async def get_message_templates(chapter: Optional[ChapterConfig] = None) -> list
         logger.warning("Cannot fetch templates: WABA ID or token not available")
         return []
 
-    templates_url = f"https://graph.facebook.com/v21.0/{waba_id}/message_templates"
+    templates_url = f"https://graph.facebook.com/v22.0/{waba_id}/message_templates"
     try:
         client = _get_client()
         response = await client.get(
