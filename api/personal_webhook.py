@@ -5,6 +5,8 @@ Endpoints:
   POST /webhook/personal-whatsapp — Receive normalized personal WhatsApp messages
   GET  /api/personal-whatsapp/auto-assign — Get auto-assign config
   PUT  /api/personal-whatsapp/auto-assign — Update auto-assign config
+  POST /api/personal-whatsapp/contacts/sync — Bulk upsert synced contacts
+  GET  /api/personal-whatsapp/contacts — List synced contacts
 
 Flow:
   1. LAD_backend receives message via Baileys (personal WhatsApp)
@@ -21,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Request, BackgroundTasks, HTTPException, Depends
 from pydantic import BaseModel
@@ -243,3 +245,116 @@ async def update_auto_assign_config(
     except Exception as e:
         logger.error(f"Error updating auto-assign config: {e}", exc_info=True)
         raise HTTPException(500, "Failed to update auto-assign config")
+
+
+# ── Synced contacts ──────────────────────────────────────────────
+
+class ContactItem(BaseModel):
+    phone: str
+    name: Optional[str] = None
+    whatsapp_id: Optional[str] = None  # raw JID from Baileys
+
+
+class ContactsSyncRequest(BaseModel):
+    contacts: List[ContactItem]
+
+
+@router.post("/api/personal-whatsapp/contacts/sync")
+async def sync_contacts(
+    body: ContactsSyncRequest,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """Bulk upsert contacts synced from the connected WhatsApp device."""
+    if not tenant_id:
+        raise HTTPException(401, "Tenant context required")
+
+    if not body.contacts:
+        return {"success": True, "synced": 0}
+
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Create table if not exists
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whatsapp_contacts (
+                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                    tenant_id UUID NOT NULL,
+                    phone TEXT NOT NULL,
+                    name TEXT,
+                    whatsapp_id TEXT,
+                    synced_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (tenant_id, phone)
+                )
+                """
+            )
+
+            synced = 0
+            for c in body.contacts:
+                await conn.execute(
+                    """
+                    INSERT INTO whatsapp_contacts (tenant_id, phone, name, whatsapp_id, synced_at)
+                    VALUES ($1::uuid, $2, $3, $4, NOW())
+                    ON CONFLICT (tenant_id, phone)
+                    DO UPDATE SET name = EXCLUDED.name, whatsapp_id = EXCLUDED.whatsapp_id, synced_at = NOW()
+                    """,
+                    tenant_id,
+                    c.phone,
+                    c.name,
+                    c.whatsapp_id,
+                )
+                synced += 1
+
+            logger.info(f"[personal_webhook] Synced {synced} contacts for tenant {tenant_id}")
+            return {"success": True, "synced": synced}
+    except Exception as e:
+        logger.error(f"Error syncing contacts: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to sync contacts")
+
+
+@router.get("/api/personal-whatsapp/contacts")
+async def list_contacts(
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """List all synced WhatsApp contacts for the tenant."""
+    if not tenant_id:
+        raise HTTPException(401, "Tenant context required")
+
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Check if table exists
+            table_exists = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'whatsapp_contacts'
+                )
+                """
+            )
+            if not table_exists:
+                return {"success": True, "data": [], "total": 0}
+
+            rows = await conn.fetch(
+                """
+                SELECT phone, name, whatsapp_id, synced_at
+                FROM whatsapp_contacts
+                WHERE tenant_id = $1::uuid
+                ORDER BY name ASC NULLS LAST, phone ASC
+                """,
+                tenant_id,
+            )
+
+            contacts = [
+                {
+                    "phone": r["phone"],
+                    "name": r["name"],
+                    "whatsapp_id": r["whatsapp_id"],
+                    "synced_at": r["synced_at"].isoformat() if r["synced_at"] else None,
+                    "is_saved": bool(r["name"]),
+                }
+                for r in rows
+            ]
+
+            return {"success": True, "data": contacts, "total": len(contacts)}
+    except Exception as e:
+        logger.error(f"Error listing contacts: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to list contacts")
