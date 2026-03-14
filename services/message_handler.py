@@ -276,16 +276,31 @@ async def _prepare_message_context(
             lead_id,
         )
 
-        if conv_row:
-            conv_id = str(conv_row["id"])
-            owner = _normalize_owner(conv_row["owner"])
-        else:
-            conv_id = str(uuid.uuid4())
-            owner = "AI"
+        # Auto-assign: for personal WhatsApp, check if saved contacts
+        # should be routed to human agent instead of AI.
+        # This applies to BOTH new and existing conversations.
+        auto_assign_owner = None
+        if channel == CHANNEL_PERSONAL:
+            # Determine saved-contact status: use the flag from Baileys,
+            # but also check the whatsapp_contacts DB table as fallback
+            # (the in-memory flag may be stale after a restart).
+            saved = is_saved_contact
+            if not saved:
+                try:
+                    saved_row = await conn.fetchval(
+                        """
+                        SELECT 1 FROM whatsapp_contacts
+                        WHERE tenant_id = $1::uuid AND phone = $2 AND name IS NOT NULL
+                        """,
+                        chapter.tenant_id,
+                        phone_number,
+                    )
+                    if saved_row:
+                        saved = True
+                except Exception:
+                    pass  # table may not exist yet
 
-            # Auto-assign: for personal WhatsApp, check if saved contacts
-            # should be routed to human agent instead of AI
-            if is_saved_contact and channel == CHANNEL_PERSONAL:
+            if saved:
                 auto_assign_row = await conn.fetchrow(
                     """
                     SELECT config FROM followup_config
@@ -295,12 +310,39 @@ async def _prepare_message_context(
                 )
                 if auto_assign_row:
                     auto_cfg = auto_assign_row["config"] or {}
+                    if isinstance(auto_cfg, str):
+                        import json as _json
+                        auto_cfg = _json.loads(auto_cfg)
                     if auto_cfg.get("enabled"):
-                        owner = "human_agent"
+                        auto_assign_owner = auto_cfg.get("saved_contacts_to", "human_agent")
                         logger.info(
-                            f"[{chapter.slug}] Auto-assigning saved contact to human agent",
+                            f"[{chapter.slug}] Auto-assign: saved contact → {auto_assign_owner}",
                             extra={"phone": phone_number, "is_saved_contact": True},
                         )
+
+        if conv_row:
+            conv_id = str(conv_row["id"])
+            owner = _normalize_owner(conv_row["owner"])
+
+            # If auto-assign says human_agent but existing conversation is AI-owned,
+            # update the conversation owner so the AI stops responding.
+            if auto_assign_owner and auto_assign_owner != owner:
+                owner = auto_assign_owner
+                await conn.execute(
+                    """
+                    UPDATE conversations SET owner = $1, updated_at = NOW()
+                    WHERE id = $2::uuid
+                    """,
+                    owner,
+                    conv_id,
+                )
+                logger.info(
+                    f"[{chapter.slug}] Updated existing conversation {conv_id} owner to {owner}",
+                    extra={"phone": phone_number},
+                )
+        else:
+            conv_id = str(uuid.uuid4())
+            owner = auto_assign_owner or "AI"
 
             await conn.execute(
                 """
