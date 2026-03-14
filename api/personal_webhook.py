@@ -313,11 +313,23 @@ async def sync_contacts(
 
 @router.get("/api/personal-whatsapp/contacts")
 async def list_contacts(
+    request: Request,
     tenant_id: Optional[str] = Depends(get_tenant_id),
 ):
-    """List all synced WhatsApp contacts for the tenant."""
+    """List all synced WhatsApp contacts for the tenant (with pagination and search)."""
     if not tenant_id:
         raise HTTPException(401, "Tenant context required")
+
+    search = request.query_params.get("search", "").strip()
+    try:
+        page = int(request.query_params.get("page", "1"))
+    except ValueError:
+        page = 1
+    try:
+        limit = min(int(request.query_params.get("limit", "100")), 500)
+    except ValueError:
+        limit = 100
+    offset = (max(page, 1) - 1) * limit
 
     try:
         async with AsyncDBConnection(tenant_id) as conn:
@@ -331,17 +343,44 @@ async def list_contacts(
                 """
             )
             if not table_exists:
-                return {"success": True, "data": [], "total": 0}
+                return {"success": True, "data": [], "total": 0, "page": page, "limit": limit}
 
-            rows = await conn.fetch(
-                """
-                SELECT phone, name, whatsapp_id, synced_at
-                FROM whatsapp_contacts
-                WHERE tenant_id = $1::uuid
-                ORDER BY name ASC NULLS LAST, phone ASC
-                """,
-                tenant_id,
-            )
+            # Build query with optional search
+            if search:
+                total = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM whatsapp_contacts
+                    WHERE tenant_id = $1::uuid
+                      AND (phone ILIKE '%' || $2 || '%' OR name ILIKE '%' || $2 || '%')
+                    """,
+                    tenant_id, search,
+                )
+                rows = await conn.fetch(
+                    """
+                    SELECT phone, name, whatsapp_id, synced_at
+                    FROM whatsapp_contacts
+                    WHERE tenant_id = $1::uuid
+                      AND (phone ILIKE '%' || $2 || '%' OR name ILIKE '%' || $2 || '%')
+                    ORDER BY name ASC NULLS LAST, phone ASC
+                    LIMIT $3 OFFSET $4
+                    """,
+                    tenant_id, search, limit, offset,
+                )
+            else:
+                total = await conn.fetchval(
+                    "SELECT COUNT(*) FROM whatsapp_contacts WHERE tenant_id = $1::uuid",
+                    tenant_id,
+                )
+                rows = await conn.fetch(
+                    """
+                    SELECT phone, name, whatsapp_id, synced_at
+                    FROM whatsapp_contacts
+                    WHERE tenant_id = $1::uuid
+                    ORDER BY name ASC NULLS LAST, phone ASC
+                    LIMIT $2 OFFSET $3
+                    """,
+                    tenant_id, limit, offset,
+                )
 
             contacts = [
                 {
@@ -354,7 +393,7 @@ async def list_contacts(
                 for r in rows
             ]
 
-            return {"success": True, "data": contacts, "total": len(contacts)}
+            return {"success": True, "data": contacts, "total": total, "page": page, "limit": limit}
     except Exception as e:
         logger.error(f"Error listing contacts: {e}", exc_info=True)
         raise HTTPException(500, "Failed to list contacts")

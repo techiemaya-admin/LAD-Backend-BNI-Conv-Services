@@ -299,11 +299,13 @@ async def debug_templates():
 
 
 @router.get("/templates")
-async def list_templates():
+async def list_templates(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Return approved WhatsApp message templates from Meta API."""
     try:
-        templates = await get_message_templates()
-        logger.info(f"Templates fetched: {len(templates)} templates found")
+        # Resolve tenant's WhatsApp account for credentials
+        chapter = get_account_by_tenant_id(tenant_id) if tenant_id else None
+        templates = await get_message_templates(chapter)
+        logger.info(f"Templates fetched: {len(templates)} templates found (tenant={tenant_id})")
         return {"success": True, "data": templates}
     except Exception as e:
         logger.error(f"Error fetching templates: {e}", exc_info=True)
