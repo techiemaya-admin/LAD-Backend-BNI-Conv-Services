@@ -1,8 +1,10 @@
 """
 Personal WhatsApp webhook — receives messages from LAD_backend's Baileys bridge.
 
-Endpoint:
+Endpoints:
   POST /webhook/personal-whatsapp — Receive normalized personal WhatsApp messages
+  GET  /api/personal-whatsapp/auto-assign — Get auto-assign config
+  PUT  /api/personal-whatsapp/auto-assign — Update auto-assign config
 
 Flow:
   1. LAD_backend receives message via Baileys (personal WhatsApp)
@@ -16,12 +18,15 @@ Reuses: leads, conversations, messages, conversation_states, prompts tables.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from typing import Optional
 
 from fastapi import APIRouter, Request, BackgroundTasks, HTTPException, Depends
+from pydantic import BaseModel
 
+from db.connection import AsyncDBConnection
 from services.message_handler import handle_incoming_message
 from services.account_registry import (
     get_account_by_tenant_and_channel,
@@ -97,6 +102,7 @@ async def receive_personal_whatsapp_message(
     personal_account = replace(account, metadata=personal_metadata)
 
     contact_name = data.get("contact_name", "")
+    is_saved_contact = data.get("is_saved_contact", False)
 
     # Process in background (same as business WhatsApp webhook)
     background_tasks.add_task(
@@ -106,6 +112,7 @@ async def receive_personal_whatsapp_message(
         contact_name,
         external_message_id,
         personal_account,
+        is_saved_contact,
     )
 
     return {"status": "received", "message_id": external_message_id}
@@ -117,6 +124,7 @@ async def _process_personal_message(
     contact_name: str,
     external_message_id: str,
     account: WhatsAppAccount,
+    is_saved_contact: bool = False,
 ):
     """Background processing of a personal WhatsApp message."""
     try:
@@ -126,9 +134,112 @@ async def _process_personal_message(
             contact_name=contact_name,
             external_message_id=external_message_id,
             chapter=account,
+            is_saved_contact=is_saved_contact,
         )
     except Exception as e:
         logger.error(
             f"[{account.slug}] Error processing personal WA message from {phone_number}: {e}",
             exc_info=True,
         )
+
+
+# ── Auto-assign settings ─────────────────────────────────────────
+
+AUTO_ASSIGN_CONFIG_KEY = "auto_assign_contacts"
+AUTO_ASSIGN_DEFAULTS = {
+    "enabled": False,
+    "saved_contacts_to": "human_agent",
+    "unsaved_contacts_to": "AI",
+}
+
+
+class AutoAssignConfigUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    saved_contacts_to: Optional[str] = None   # "human_agent" or "AI"
+    unsaved_contacts_to: Optional[str] = None  # "AI" or "human_agent"
+
+
+@router.get("/api/personal-whatsapp/auto-assign")
+async def get_auto_assign_config(
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """Get auto-assign configuration for personal WhatsApp contacts."""
+    if not tenant_id:
+        raise HTTPException(401, "Tenant context required")
+
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            row = await conn.fetchrow(
+                "SELECT config FROM followup_config WHERE config_key = $1 AND tenant_id = $2::uuid",
+                AUTO_ASSIGN_CONFIG_KEY,
+                tenant_id,
+            )
+
+            if row:
+                cfg = row["config"]
+                config = json.loads(cfg) if isinstance(cfg, str) else cfg
+            else:
+                config = dict(AUTO_ASSIGN_DEFAULTS)
+
+            return {"success": True, "data": config}
+    except Exception as e:
+        logger.error(f"Error fetching auto-assign config: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to fetch auto-assign config")
+
+
+@router.put("/api/personal-whatsapp/auto-assign")
+async def update_auto_assign_config(
+    body: AutoAssignConfigUpdate,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """Update auto-assign configuration for personal WhatsApp contacts."""
+    if not tenant_id:
+        raise HTTPException(401, "Tenant context required")
+
+    # Validate owner values
+    valid_owners = {"AI", "human_agent"}
+    if body.saved_contacts_to and body.saved_contacts_to not in valid_owners:
+        raise HTTPException(400, "saved_contacts_to must be 'AI' or 'human_agent'")
+    if body.unsaved_contacts_to and body.unsaved_contacts_to not in valid_owners:
+        raise HTTPException(400, "unsaved_contacts_to must be 'AI' or 'human_agent'")
+
+    try:
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Get current config or defaults
+            row = await conn.fetchrow(
+                """
+                SELECT config FROM followup_config
+                WHERE config_key = $1 AND tenant_id = $2::uuid
+                """,
+                AUTO_ASSIGN_CONFIG_KEY,
+                tenant_id,
+            )
+
+            if row:
+                current = row["config"]
+                current = json.loads(current) if isinstance(current, str) else current
+            else:
+                current = dict(AUTO_ASSIGN_DEFAULTS)
+
+            # Merge updates
+            updates = body.model_dump(exclude_none=True)
+            current.update(updates)
+
+            # Upsert
+            await conn.execute(
+                """
+                INSERT INTO followup_config (config_key, config, tenant_id, updated_at)
+                VALUES ($1, $2::jsonb, $3::uuid, NOW())
+                ON CONFLICT (config_key, tenant_id)
+                DO UPDATE SET config = $2::jsonb, updated_at = NOW()
+                """,
+                AUTO_ASSIGN_CONFIG_KEY,
+                json.dumps(current),
+                tenant_id,
+            )
+
+            logger.info(f"[personal_webhook] Auto-assign config updated for tenant {tenant_id}: {current}")
+            return {"success": True, "data": current}
+    except Exception as e:
+        logger.error(f"Error updating auto-assign config: {e}", exc_info=True)
+        raise HTTPException(500, "Failed to update auto-assign config")

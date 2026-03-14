@@ -23,7 +23,7 @@ class OwnershipTransferRequest(BaseModel):
     human_agent_id: Optional[str] = None
 
 
-def _normalize_owner_input(raw_owner: str | None) -> str | None:
+def _normalize_owner_input(raw_owner: Optional[str]) -> Optional[str]:
     val = (raw_owner or "").strip().lower()
     if val in {"ai", "agent", "bot"}:
         return "AI"

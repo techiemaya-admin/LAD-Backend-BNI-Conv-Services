@@ -206,6 +206,7 @@ async def _prepare_message_context(
     message_text: str,
     external_message_id: str,
     chapter: WhatsAppAccount,
+    is_saved_contact: bool = False,
 ) -> tuple[str, str, str, bool]:
     """Prepare lead/conversation context in one connection.
 
@@ -281,14 +282,35 @@ async def _prepare_message_context(
         else:
             conv_id = str(uuid.uuid4())
             owner = "AI"
+
+            # Auto-assign: for personal WhatsApp, check if saved contacts
+            # should be routed to human agent instead of AI
+            if is_saved_contact and channel == CHANNEL_PERSONAL:
+                auto_assign_row = await conn.fetchrow(
+                    """
+                    SELECT config FROM followup_config
+                    WHERE config_key = 'auto_assign_contacts' AND tenant_id = $1::uuid
+                    """,
+                    chapter.tenant_id,
+                )
+                if auto_assign_row:
+                    auto_cfg = auto_assign_row["config"] or {}
+                    if auto_cfg.get("enabled"):
+                        owner = "human_agent"
+                        logger.info(
+                            f"[{chapter.slug}] Auto-assigning saved contact to human agent",
+                            extra={"phone": phone_number, "is_saved_contact": True},
+                        )
+
             await conn.execute(
                 """
                 INSERT INTO conversations (id, lead_id, channel, status, owner, metadata, tenant_id, started_at, updated_at)
-                VALUES ($1::uuid, $2::uuid, $3, 'active', 'AI', '{}', $4::uuid, NOW(), NOW())
+                VALUES ($1::uuid, $2::uuid, $3, 'active', $4, '{}', $5::uuid, NOW(), NOW())
                 """,
                 conv_id,
                 lead_id,
                 channel,
+                owner,
                 chapter.tenant_id,
             )
 
@@ -321,6 +343,7 @@ async def handle_incoming_message(
     contact_name: str,
     external_message_id: str,
     chapter: WhatsAppAccount,
+    is_saved_contact: bool = False,
 ):
     """Main entry point for incoming WhatsApp messages."""
     t_start = time.time()
@@ -343,6 +366,7 @@ async def handle_incoming_message(
         message_text=message_text,
         external_message_id=external_message_id,
         chapter=chapter,
+        is_saved_contact=is_saved_contact,
     )
     logger.info(f"[{chapter.slug}][TIMING] db_prepare_context_total: {time.time()-t0:.3f}s")
 
