@@ -113,6 +113,9 @@ async def list_conversations(
             # Exclude soft-deleted
             where_clauses.append("(c.is_deleted IS NULL OR c.is_deleted = false)")
 
+            # Exclude WhatsApp group JIDs (not real phone numbers)
+            where_clauses.append("(l.phone IS NULL OR l.phone !~ '^120363\\d{10,}$')")
+
             if status:
                 where_clauses.append(f"c.status = ${idx}")
                 params.append(status)
