@@ -45,6 +45,16 @@ class ChatGroupAddConversations(BaseModel):
     conversation_ids: list[str]
 
 
+class ContactImportItem(BaseModel):
+    name: str | None = None
+    phone: str | None = None
+    email: str | None = None
+
+
+class ChatGroupImportContacts(BaseModel):
+    contacts: list[ContactImportItem]
+
+
 class ChatGroupTemplateSend(BaseModel):
     template_name: str
     language_code: str = "en_GB"
@@ -362,6 +372,114 @@ async def get_group_messages(
     except Exception as e:
         logger.error(f"Error fetching group messages: {e}", exc_info=True)
         return {"success": False, "data": [], "has_more": False, "error": str(e)}
+
+
+# ── Import contacts into group (create leads + conversations) ─────
+
+@router.post("/api/chat-groups/{group_id}/import-contacts")
+async def import_contacts_to_group(
+    group_id: str,
+    body: ChatGroupImportContacts,
+    tenant_id: Optional[str] = Depends(get_tenant_id),
+):
+    """
+    Import contacts into a chat group. For each contact:
+    1. Find or create a lead (by phone or email)
+    2. Find or create a conversation for that lead
+    3. Add the conversation to the group
+    """
+    try:
+        imported = 0
+        skipped = 0
+
+        async with AsyncDBConnection(tenant_id) as conn:
+            # Verify group exists
+            group = await conn.fetchrow(
+                "SELECT id FROM chat_groups WHERE id = $1::uuid", group_id
+            )
+            if not group:
+                return {"success": False, "error": "Group not found"}
+
+            for contact in body.contacts:
+                phone = contact.phone
+                email = contact.email
+                name = contact.name
+
+                if not phone and not email:
+                    skipped += 1
+                    continue
+
+                try:
+                    # Find existing lead by phone or email
+                    lead = None
+                    if phone:
+                        lead = await conn.fetchrow(
+                            "SELECT id FROM leads WHERE phone = $1 AND tenant_id = $2::uuid",
+                            phone, tenant_id,
+                        )
+                    if not lead and email:
+                        lead = await conn.fetchrow(
+                            "SELECT id FROM leads WHERE email = $1 AND tenant_id = $2::uuid",
+                            email, tenant_id,
+                        )
+
+                    # Create lead if not found
+                    if not lead:
+                        lead = await conn.fetchrow(
+                            """
+                            INSERT INTO leads (name, phone, email, source, tenant_id)
+                            VALUES ($1, $2, $3, 'crm_import', $4::uuid)
+                            RETURNING id
+                            """,
+                            name or phone or email,
+                            phone,
+                            email,
+                            tenant_id,
+                        )
+
+                    lead_id = str(lead["id"])
+
+                    # Find existing conversation for this lead
+                    conv = await conn.fetchrow(
+                        "SELECT id FROM conversations WHERE lead_id = $1::uuid AND tenant_id = $2::uuid ORDER BY updated_at DESC LIMIT 1",
+                        lead_id, tenant_id,
+                    )
+
+                    # Create conversation if not found
+                    if not conv:
+                        conv = await conn.fetchrow(
+                            """
+                            INSERT INTO conversations (lead_id, channel, status, owner, tenant_id)
+                            VALUES ($1::uuid, 'whatsapp', 'active', 'AI', $2::uuid)
+                            RETURNING id
+                            """,
+                            lead_id, tenant_id,
+                        )
+
+                    conv_id = str(conv["id"])
+
+                    # Add conversation to group
+                    await conn.execute(
+                        """
+                        INSERT INTO chat_group_conversations (group_id, conversation_id)
+                        VALUES ($1::uuid, $2::uuid)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        group_id, conv_id,
+                    )
+                    imported += 1
+
+                except Exception as ce:
+                    logger.warning(f"Error importing contact {phone or email}: {ce}")
+                    skipped += 1
+
+        return {
+            "success": True,
+            "data": {"imported": imported, "skipped": skipped},
+        }
+    except Exception as e:
+        logger.error(f"Error importing contacts to group: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 
 # ── Group template broadcast ──────────────────────────────────────
