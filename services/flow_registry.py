@@ -57,6 +57,7 @@ GENERIC_FLOW = FlowTemplate(
         "greeting": "GREETING",
         "active": "ACTIVE",
         "idle": "IDLE",
+        "waitlist": "WAITLIST",
     },
     initial_status="greeting",
     profile_fields=[],  # Generic: no predefined fields, all in profile_data JSONB
