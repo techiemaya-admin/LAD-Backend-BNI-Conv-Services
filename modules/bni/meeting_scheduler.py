@@ -322,7 +322,7 @@ async def _notify_member_b_for_availability(
             f"work for you this week? (e.g., 'Tuesday 2-4pm, Wednesday 10am-12pm')"
         )
         await whatsapp_client.send_message(
-            phone_number=member_b_phone, text=message, chapter=account
+            phone_number=member_b_phone, text=message, account=account
         )
         logger.info(f"Notified member B ({member_b_phone}) for availability")
 
@@ -386,7 +386,7 @@ async def _propose_time_to_both(
             f"{time_str}. Does this work for you? (Reply 'yes' to confirm or 'no' to reschedule)"
         )
         await whatsapp_client.send_message(
-            phone_number=phone, text=message, chapter=account
+            phone_number=phone, text=message, account=account
         )
 
     logger.info(f"Proposed time {time_str} to both members")

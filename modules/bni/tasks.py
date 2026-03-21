@@ -80,7 +80,7 @@ async def _send_reminders_for_tenant(account: WhatsAppAccount):
                 )
 
             await whatsapp_client.send_message(
-                phone_number=phone, text=message, chapter=account
+                phone_number=phone, text=message, account=account
             )
 
             await conn.execute(
@@ -151,7 +151,7 @@ async def _send_followups_for_tenant(account: WhatsAppAccount):
                 )
 
                 await whatsapp_client.send_message(
-                    phone_number=phone, text=message, chapter=account
+                    phone_number=phone, text=message, account=account
                 )
 
                 await conn.execute(
@@ -259,7 +259,7 @@ async def _send_icp_followups_for_tenant(account: WhatsAppAccount):
                 c.id AS conversation_id,
                 l.id AS lead_id
             FROM conversation_states cs
-            LEFT JOIN leads l ON l.phone = cs.phone
+            LEFT JOIN wa_contacts l ON l.phone = cs.phone
             LEFT JOIN conversations c
                 ON c.lead_id = l.id AND c.status = 'active'
             WHERE cs.context_status = ANY($1::text[])
@@ -301,7 +301,7 @@ async def _send_icp_followups_for_tenant(account: WhatsAppAccount):
                 text=message,
                 conversation_id=conversation_id,
                 lead_id=lead_id,
-                chapter=account,
+                account=account,
             )
 
             if wa_id:

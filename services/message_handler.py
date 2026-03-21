@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 _processed_messages: Dict[str, float] = {}
 DEDUP_TTL_SECONDS = 300  # 5 minutes
 
-# Per-member debounce buffers: {phone: {"messages": [], "task": Task, "chapter": WhatsAppAccount}}
+# Per-member debounce buffers: {phone: {"messages": [], "task": Task, "account": WhatsAppAccount}}
 _member_buffers: Dict[str, dict] = {}
 DEBOUNCE_SECONDS = 1
 
@@ -66,11 +66,11 @@ def _is_duplicate(external_message_id: str) -> bool:
     return False
 
 
-async def _db_dedup_check(lead_id: str, message_text: str, chapter: WhatsAppAccount) -> bool:
+async def _db_dedup_check(lead_id: str, message_text: str, account: WhatsAppAccount) -> bool:
     """Check DB-level dedup (30-second window)."""
     msg_hash = hashlib.sha256(f"{lead_id}:{message_text}".encode()).hexdigest()
     try:
-        async with AsyncDBConnection(chapter.tenant_id) as conn:
+        async with AsyncDBConnection(account.tenant_id) as conn:
             existing = await conn.fetchval(
                 """
                 SELECT 1 FROM processed_messages
@@ -86,19 +86,19 @@ async def _db_dedup_check(lead_id: str, message_text: str, chapter: WhatsAppAcco
                 "INSERT INTO processed_messages (lead_id, message_hash, tenant_id) VALUES ($1, $2, $3::uuid)",
                 lead_id,
                 msg_hash,
-                chapter.tenant_id,
+                account.tenant_id,
             )
             return False
     except Exception as e:
-        logger.error(f"[{chapter.slug}] DB dedup check error: {e}")
+        logger.error(f"[{account.slug}] DB dedup check error: {e}")
         return False
 
 
-async def _get_or_create_lead(phone_number: str, contact_name: str, chapter: WhatsAppAccount) -> dict:
+async def _get_or_create_lead(phone_number: str, contact_name: str, account: WhatsAppAccount) -> dict:
     """Get or create a lead by phone number. Returns {id, name, phone}."""
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         row = await conn.fetchrow(
-            "SELECT id, name, phone FROM leads WHERE phone = $1", phone_number
+            "SELECT id, name, phone FROM wa_contacts WHERE phone = $1", phone_number
         )
         if row:
             return {"id": str(row["id"]), "name": row["name"], "phone": row["phone"]}
@@ -107,20 +107,20 @@ async def _get_or_create_lead(phone_number: str, contact_name: str, chapter: Wha
         name = contact_name or phone_number
         await conn.execute(
             """
-            INSERT INTO leads (id, organization_id, name, phone, channel, status, tenant_id, created_at, updated_at)
-            VALUES ($1::uuid, $2::uuid, $3, $4, 'whatsapp', 'active', $2::uuid, NOW(), NOW())
+            INSERT INTO wa_contacts (id, name, phone, channel, status, tenant_id, created_at, updated_at)
+            VALUES ($1::uuid, $2, $3, 'whatsapp', 'active', $4::uuid, NOW(), NOW())
             """,
             lead_id,
-            chapter.tenant_id,
             name,
             phone_number,
+            account.tenant_id,
         )
         return {"id": lead_id, "name": name, "phone": phone_number}
 
 
-async def _get_or_create_conversation(lead_id: str, chapter: WhatsAppAccount) -> dict:
+async def _get_or_create_conversation(lead_id: str, account: WhatsAppAccount) -> dict:
     """Get active conversation or create one. Returns {id, lead_id, owner}."""
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         row = await conn.fetchrow(
             """
             SELECT id, lead_id, owner FROM conversations
@@ -144,18 +144,18 @@ async def _get_or_create_conversation(lead_id: str, chapter: WhatsAppAccount) ->
             """,
             conv_id,
             lead_id,
-            chapter.tenant_id,
+            account.tenant_id,
         )
         return {"id": conv_id, "lead_id": lead_id, "owner": "AI"}
 
 
 async def _save_incoming_message(
     conversation_id: str, lead_id: str, content: str, external_message_id: str,
-    chapter: WhatsAppAccount,
+    account: WhatsAppAccount,
 ):
     """Save incoming user message to DB."""
     msg_id = str(uuid.uuid4())
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         await conn.execute(
             """
             INSERT INTO messages (id, conversation_id, lead_id, role, content,
@@ -167,17 +167,17 @@ async def _save_incoming_message(
             lead_id,
             content,
             external_message_id,
-            chapter.tenant_id,
+            account.tenant_id,
         )
 
 
 async def _save_outgoing_message(
     conversation_id: str, lead_id: str, content: str,
-    chapter: WhatsAppAccount,
+    account: WhatsAppAccount,
 ):
     """Save outgoing agent message to DB."""
     msg_id = str(uuid.uuid4())
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         await conn.execute(
             """
             INSERT INTO messages (id, conversation_id, lead_id, role, content,
@@ -188,13 +188,13 @@ async def _save_outgoing_message(
             conversation_id,
             lead_id,
             content,
-            chapter.tenant_id,
+            account.tenant_id,
         )
 
 
-async def _update_conversation_timestamp(conv_id: str, chapter: WhatsAppAccount):
+async def _update_conversation_timestamp(conv_id: str, account: WhatsAppAccount):
     """Update conversation's last activity timestamp."""
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         await conn.execute(
             "UPDATE conversations SET updated_at = NOW() WHERE id = $1::uuid", conv_id
         )
@@ -205,7 +205,7 @@ async def _prepare_message_context(
     contact_name: str,
     message_text: str,
     external_message_id: str,
-    chapter: WhatsAppAccount,
+    account: WhatsAppAccount,
     is_saved_contact: bool = False,
 ) -> tuple[str, str, str, bool]:
     """Prepare lead/conversation context in one connection.
@@ -214,10 +214,10 @@ async def _prepare_message_context(
     """
     msg_hash = hashlib.sha256(f"{phone_number}:{message_text}".encode()).hexdigest()
 
-    async with AsyncDBConnection(chapter.tenant_id) as conn:
+    async with AsyncDBConnection(account.tenant_id) as conn:
         # 1) Lead
         lead_row = await conn.fetchrow(
-            "SELECT id, name, phone FROM leads WHERE phone = $1",
+            "SELECT id, name, phone FROM wa_contacts WHERE phone = $1",
             phone_number,
         )
 
@@ -228,13 +228,13 @@ async def _prepare_message_context(
             name = contact_name or phone_number
             await conn.execute(
                 """
-                INSERT INTO leads (id, organization_id, name, phone, channel, status, tenant_id, created_at, updated_at)
-                VALUES ($1::uuid, $2::uuid, $3, $4, 'whatsapp', 'active', $2::uuid, NOW(), NOW())
+                INSERT INTO wa_contacts (id, name, phone, channel, status, tenant_id, created_at, updated_at)
+                VALUES ($1::uuid, $2, $3, 'whatsapp', 'active', $4::uuid, NOW(), NOW())
                 """,
                 lead_id,
-                chapter.tenant_id,
                 name,
                 phone_number,
+                account.tenant_id,
             )
 
         # 2) DB dedup
@@ -254,12 +254,12 @@ async def _prepare_message_context(
             "INSERT INTO processed_messages (lead_id, message_hash, tenant_id) VALUES ($1, $2, $3::uuid)",
             lead_id,
             msg_hash,
-            chapter.tenant_id,
+            account.tenant_id,
         )
 
         # 3) Conversation — scoped by channel so the same lead gets separate
         #    conversations for business vs personal WhatsApp.
-        channel = chapter.metadata.get("channel", CHANNEL_BUSINESS)
+        channel = account.metadata.get("channel", CHANNEL_BUSINESS)
         # Legacy rows have channel='whatsapp' or NULL — treat as business_whatsapp
         if channel == CHANNEL_PERSONAL:
             channel_filter = "AND channel = 'personal_whatsapp'"
@@ -292,7 +292,7 @@ async def _prepare_message_context(
                         SELECT 1 FROM whatsapp_contacts
                         WHERE tenant_id = $1::uuid AND phone = $2 AND name IS NOT NULL
                         """,
-                        chapter.tenant_id,
+                        account.tenant_id,
                         phone_number,
                     )
                     if saved_row:
@@ -306,7 +306,7 @@ async def _prepare_message_context(
                     SELECT config FROM followup_config
                     WHERE config_key = 'auto_assign_contacts' AND tenant_id = $1::uuid
                     """,
-                    chapter.tenant_id,
+                    account.tenant_id,
                 )
                 if auto_assign_row:
                     auto_cfg = auto_assign_row["config"] or {}
@@ -316,7 +316,7 @@ async def _prepare_message_context(
                     if auto_cfg.get("enabled"):
                         auto_assign_owner = auto_cfg.get("saved_contacts_to", "human_agent")
                         logger.info(
-                            f"[{chapter.slug}] Auto-assign: saved contact → {auto_assign_owner}",
+                            f"[{account.slug}] Auto-assign: saved contact → {auto_assign_owner}",
                             extra={"phone": phone_number, "is_saved_contact": True},
                         )
 
@@ -337,7 +337,7 @@ async def _prepare_message_context(
                     conv_id,
                 )
                 logger.info(
-                    f"[{chapter.slug}] Updated existing conversation {conv_id} owner to {owner}",
+                    f"[{account.slug}] Updated existing conversation {conv_id} owner to {owner}",
                     extra={"phone": phone_number},
                 )
         else:
@@ -353,7 +353,7 @@ async def _prepare_message_context(
                 lead_id,
                 channel,
                 owner,
-                chapter.tenant_id,
+                account.tenant_id,
             )
 
         # 4) Save incoming + bump timestamp
@@ -369,7 +369,7 @@ async def _prepare_message_context(
             lead_id,
             message_text,
             external_message_id,
-            chapter.tenant_id,
+            account.tenant_id,
         )
         await conn.execute(
             "UPDATE conversations SET updated_at = NOW() WHERE id = $1::uuid",
@@ -384,7 +384,7 @@ async def handle_incoming_message(
     message_text: str,
     contact_name: str,
     external_message_id: str,
-    chapter: WhatsAppAccount,
+    account: WhatsAppAccount,
     is_saved_contact: bool = False,
 ):
     """Main entry point for incoming WhatsApp messages."""
@@ -392,13 +392,13 @@ async def handle_incoming_message(
 
     # Layer 1: In-memory dedup
     if _is_duplicate(external_message_id):
-        logger.debug(f"[{chapter.slug}] Duplicate message {external_message_id}, skipping")
+        logger.debug(f"[{account.slug}] Duplicate message {external_message_id}, skipping")
         return
 
     # Mark message as read immediately (blue ticks) — skip for personal WhatsApp
-    is_personal = chapter.metadata.get("channel") == "personal_whatsapp"
+    is_personal = account.metadata.get("channel") == "personal_whatsapp"
     if not is_personal:
-        asyncio.create_task(whatsapp_client.mark_as_read(external_message_id, chapter=chapter))
+        asyncio.create_task(whatsapp_client.mark_as_read(external_message_id, account=account))
 
     # Step 1-4: Prepare lead/conversation + dedup + save in one DB connection
     t0 = time.time()
@@ -407,34 +407,34 @@ async def handle_incoming_message(
         contact_name=contact_name,
         message_text=message_text,
         external_message_id=external_message_id,
-        chapter=chapter,
+        account=account,
         is_saved_contact=is_saved_contact,
     )
-    logger.info(f"[{chapter.slug}][TIMING] db_prepare_context_total: {time.time()-t0:.3f}s")
+    logger.info(f"[{account.slug}][TIMING] db_prepare_context_total: {time.time()-t0:.3f}s")
 
     if dedup_result:
-        logger.debug(f"[{chapter.slug}] DB duplicate for lead {lead_id}, skipping")
+        logger.debug(f"[{account.slug}] DB duplicate for lead {lead_id}, skipping")
         return
 
-    logger.info(f"[{chapter.slug}][TIMING] pre-debounce total: {time.time()-t_start:.3f}s")
+    logger.info(f"[{account.slug}][TIMING] pre-debounce total: {time.time()-t_start:.3f}s")
 
     # Check ownership — skip LLM if human agent owns the conversation
     if owner == "human_agent":
-        logger.info(f"[{chapter.slug}] Human agent owns conversation {conv_id}, skipping AI")
+        logger.info(f"[{account.slug}] Human agent owns conversation {conv_id}, skipping AI")
         return
 
     # Debounce: buffer messages per member+channel, flush after 1s of silence.
     # Include channel in key so the same phone on personal vs business WA
     # doesn't collide in the buffer.
-    channel = chapter.metadata.get("channel", CHANNEL_BUSINESS)
+    channel = account.metadata.get("channel", CHANNEL_BUSINESS)
     buffer_key = f"{phone_number}:{channel}"
 
     if buffer_key not in _member_buffers:
-        _member_buffers[buffer_key] = {"messages": [], "task": None, "chapter": chapter}
+        _member_buffers[buffer_key] = {"messages": [], "task": None, "account": account}
 
     buf = _member_buffers[buffer_key]
     buf["messages"].append(message_text)
-    buf["chapter"] = chapter  # Update chapter ref
+    buf["account"] = account  # Update account ref
 
     # Cancel existing flush task if any
     if buf["task"] and not buf["task"].done():
@@ -442,13 +442,13 @@ async def handle_incoming_message(
 
     # Schedule new flush
     buf["task"] = asyncio.create_task(
-        _flush_buffer(buffer_key, phone_number, lead_id, conv_id, contact_name, chapter)
+        _flush_buffer(buffer_key, phone_number, lead_id, conv_id, contact_name, account)
     )
 
 
 async def _flush_buffer(
     buffer_key: str, phone_number: str, lead_id: str, conv_id: str,
-    contact_name: str, chapter: WhatsAppAccount,
+    contact_name: str, account: WhatsAppAccount,
 ):
     """Wait for debounce period, then process combined messages."""
     try:
@@ -467,10 +467,10 @@ async def _flush_buffer(
     async with lock:
         try:
             logger.info(
-                f"[{chapter.slug}] Processing {len(combined)} chars from {phone_number}",
+                f"[{account.slug}] Processing {len(combined)} chars from {phone_number}",
                 extra={"lead_id": lead_id, "conv_id": conv_id}
             )
-            
+
             t_llm = time.time()
             reply = await process_conversation(
                 phone_number=phone_number,
@@ -478,20 +478,20 @@ async def _flush_buffer(
                 conversation_id=conv_id,
                 message_text=combined,
                 contact_name=contact_name,
-                account=chapter,
+                account=account,
             )
-            logger.info(f"[{chapter.slug}][TIMING] process_conversation (LLM pipeline): {time.time()-t_llm:.3f}s")
+            logger.info(f"[{account.slug}][TIMING] process_conversation (LLM pipeline): {time.time()-t_llm:.3f}s")
 
             if not reply:
                 logger.warning(
-                    f"[{chapter.slug}] LLM returned empty response for {phone_number}",
+                    f"[{account.slug}] LLM returned empty response for {phone_number}",
                     extra={"lead_id": lead_id}
                 )
                 # Don't send error message — just log and continue
                 return
 
             logger.info(
-                f"[{chapter.slug}] AI Reply ready ({len(reply)} chars): {reply[:100]}...",
+                f"[{account.slug}] AI Reply ready ({len(reply)} chars): {reply[:100]}...",
                 extra={"phone_number": phone_number}
             )
 
@@ -501,18 +501,18 @@ async def _flush_buffer(
                 text=reply,
                 conversation_id=conv_id,
                 lead_id=lead_id,
-                chapter=chapter,
+                account=account,
             )
-            logger.info(f"[{chapter.slug}][TIMING] whatsapp_send: {time.time()-t_wa:.3f}s, sent: {sent}")
-            
+            logger.info(f"[{account.slug}][TIMING] whatsapp_send: {time.time()-t_wa:.3f}s, sent: {sent}")
+
             if not sent:
                 logger.error(
-                    f"[{chapter.slug}] Failed to send reply to {phone_number}",
+                    f"[{account.slug}] Failed to send reply to {phone_number}",
                     extra={"reply_text": reply[:50]}
                 )
         except Exception as e:
             logger.error(
-                f"[{chapter.slug}] Error processing message for {phone_number}: {e}", 
+                f"[{account.slug}] Error processing message for {phone_number}: {e}",
                 exc_info=True,
                 extra={"lead_id": lead_id}
             )
@@ -523,46 +523,46 @@ async def _send_reply(
     text: str,
     conversation_id: str,
     lead_id: str,
-    chapter: WhatsAppAccount,
+    account: WhatsAppAccount,
 ) -> bool:
     """Route reply to the correct channel client.
 
     For personal WhatsApp (Baileys), sends via LAD_backend.
     For business WhatsApp (Cloud API), sends via Meta Graph API.
-    
+
     Returns:
         True if message was sent successfully, False otherwise.
     """
-    channel = chapter.metadata.get("channel", "business_whatsapp")
-    slug = chapter.slug
+    channel = account.metadata.get("channel", "business_whatsapp")
+    slug = account.slug
 
     try:
         if channel == "personal_whatsapp":
-            personal_account_id = chapter.metadata.get("personal_account_id", "")
-            lad_backend_url = chapter.metadata.get("lad_backend_url") or None
-            
+            personal_account_id = account.metadata.get("personal_account_id", "")
+            lad_backend_url = account.metadata.get("lad_backend_url") or None
+
             if not personal_account_id:
                 logger.error(
                     f"[{slug}] Missing personal_account_id in metadata for personal WhatsApp channel",
                     extra={"phone_number": phone_number}
                 )
                 return False
-            
+
             logger.info(
                 f"[{slug}] Sending via personal WhatsApp channel",
                 extra={"account_id": personal_account_id, "to": phone_number}
             )
-            
+
             gateway_msg_id = await personal_whatsapp_client.send_message(
                 phone_number=phone_number,
                 text=text,
                 personal_account_id=personal_account_id,
                 conversation_id=conversation_id,
                 lead_id=lead_id,
-                account=chapter,
+                account=account,
                 lad_backend_url=lad_backend_url,
             )
-            
+
             if gateway_msg_id:
                 logger.info(
                     f"[{slug}] Personal WhatsApp message sent successfully",
@@ -580,15 +580,15 @@ async def _send_reply(
                 f"[{slug}] Sending via business WhatsApp channel",
                 extra={"to": phone_number}
             )
-            
+
             gateway_msg_id = await whatsapp_client.send_message(
                 phone_number=phone_number,
                 text=text,
                 conversation_id=conversation_id,
                 lead_id=lead_id,
-                chapter=chapter,
+                account=account,
             )
-            
+
             if gateway_msg_id:
                 logger.info(
                     f"[{slug}] Business WhatsApp message sent successfully",
@@ -601,7 +601,7 @@ async def _send_reply(
                     extra={"to": phone_number}
                 )
                 return False
-                
+
     except Exception as e:
         logger.error(
             f"[{slug}] Exception sending reply to {phone_number}: {e}",

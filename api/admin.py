@@ -2,10 +2,10 @@
 Admin API
 
 Endpoints for managing WhatsApp accounts and tenant onboarding.
-Supports both generic clients and BNI-specific chapters.
+Supports all tenant types (generic, BNI, or any industry flow template).
 Protected endpoints (should be behind auth in production).
 
-Backward-compatible: /admin/chapters still works as alias.
+Backward-compatible: /admin/chapters still works as alias for /admin/accounts.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from db.connection import CoreDBConnection, reload_tenant_config
+from db.schema import core_table  # Architecture Rule I.3: no lad_dev.* hardcoding
 from middleware.tenant import get_tenant_id
 from services.account_registry import (
     reload_accounts as reload_chapters,
@@ -129,48 +130,53 @@ async def create_account(body: WhatsAppAccountCreateRequest):
     tenant_id = body.tenant_id or str(uuid.uuid4())
 
     try:
+        # M5: All three core-DB inserts wrapped in a single transaction.
+        # If any step fails, the entire provisioning is rolled back — no partial records.
         async with CoreDBConnection() as conn:
-            # Create tenant if needed
-            if not body.tenant_id:
-                await conn.execute(
-                    """
-                    INSERT INTO lad_dev.tenants (id, name, is_active)
-                    VALUES ($1::uuid, $2, true)
-                    ON CONFLICT (id) DO NOTHING
+            async with conn.transaction():
+                # Step 1: Create tenant record (if not provided by caller)
+                if not body.tenant_id:
+                    await conn.execute(
+                        f"""
+                        INSERT INTO {core_table("tenants")} (id, name, status)
+                        VALUES ($1::uuid, $2, 'active')
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        tenant_id, body.display_name,
+                    )
+
+                # Step 2: Insert WhatsApp account config
+                row = await conn.fetchrow(
+                    f"""
+                    INSERT INTO {core_table("social_whatsapp_accounts")} (
+                        tenant_id, slug, display_name,
+                        phone_number_id, access_token,
+                        business_account_id, verify_token,
+                        ai_model, ai_api_key, timezone,
+                        conversation_flow_template, status
+                    ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active')
+                    RETURNING id, tenant_id, slug, display_name, created_at
                     """,
-                    tenant_id, body.display_name,
+                    tenant_id, body.slug, body.display_name,
+                    body.phone_number_id, body.access_token,
+                    body.business_account_id, body.verify_token,
+                    body.ai_model, body.ai_api_key, body.timezone,
+                    body.conversation_flow_template,
                 )
 
-            # Insert WhatsApp account config
-            row = await conn.fetchrow(
-                """
-                INSERT INTO lad_dev.social_whatsapp_accounts (
-                    tenant_id, slug, display_name,
-                    phone_number_id, access_token,
-                    business_account_id, verify_token,
-                    ai_model, ai_api_key, timezone,
-                    conversation_flow_template, status
-                ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active')
-                RETURNING id, tenant_id, slug, display_name, created_at
-                """,
-                tenant_id, body.slug, body.display_name,
-                body.phone_number_id, body.access_token,
-                body.business_account_id, body.verify_token,
-                body.ai_model, body.ai_api_key, body.timezone,
-                body.conversation_flow_template,
-            )
+                # Step 3: Register tenant database routing (must be inside transaction
+                # so if this fails, the tenant + WA account rows are also rolled back)
+                await conn.execute(
+                    f"""
+                    INSERT INTO {core_table("tenant_database_config")} (tenant_id, database_url)
+                    VALUES ($1::uuid, $2)
+                    ON CONFLICT (tenant_id) DO UPDATE SET database_url = $2
+                    """,
+                    tenant_id, body.database_url,
+                )
 
-            # Insert tenant database routing
-            await conn.execute(
-                """
-                INSERT INTO lad_dev.tenant_database_config (tenant_id, database_url)
-                VALUES ($1::uuid, $2)
-                ON CONFLICT (tenant_id) DO UPDATE SET database_url = $2
-                """,
-                tenant_id, body.database_url,
-            )
-
-        # Create required tables in the tenant's database
+        # Steps 4-5 run AFTER the transaction commits (tenant_database_config must
+        # exist before AsyncDBConnection can resolve the per-tenant pool)
         await _ensure_tenant_tables(body.database_url, tenant_id, body.conversation_flow_template)
 
         # Seed default prompts
@@ -234,7 +240,7 @@ async def update_account(slug: str, body: WhatsAppAccountUpdateRequest):
         async with CoreDBConnection() as conn:
             await conn.execute(
                 f"""
-                UPDATE lad_dev.social_whatsapp_accounts
+                UPDATE {core_table("social_whatsapp_accounts")}
                 SET {', '.join(set_clauses)}
                 WHERE tenant_id = ${idx}::uuid
                 """,
@@ -264,8 +270,8 @@ async def deactivate_account(slug: str):
     try:
         async with CoreDBConnection() as conn:
             await conn.execute(
-                """
-                UPDATE lad_dev.social_whatsapp_accounts
+                f"""
+                UPDATE {core_table("social_whatsapp_accounts")}
                 SET status = 'inactive', updated_at = NOW()
                 WHERE tenant_id = $1::uuid
                 """,
@@ -360,50 +366,55 @@ async def _ensure_tenant_tables(database_url: str, tenant_id: str, flow_template
     conn = await asyncpg.connect(database_url)
     try:
         # ---- Generic tables (all tenants) ----
+        # M1: wa_contacts replaces leads (no organization_id, adds core_lead_id + is_deleted)
+        # M2: organization_id removed
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS leads (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                organization_id UUID,
-                name VARCHAR(200),
-                phone VARCHAR(50),
-                email VARCHAR(200),
-                company VARCHAR(255),
-                channel VARCHAR(50) DEFAULT 'whatsapp',
-                stage VARCHAR(100),
-                status VARCHAR(50) DEFAULT 'active',
-                source VARCHAR(100),
-                metadata JSONB DEFAULT '{}',
-                tenant_id UUID NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS wa_contacts (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id       UUID NOT NULL,
+                name            VARCHAR(200),
+                phone           VARCHAR(50),
+                email           VARCHAR(200),
+                company         VARCHAR(255),
+                channel         VARCHAR(50)  DEFAULT 'whatsapp',
+                stage           VARCHAR(100),
+                status          VARCHAR(50)  DEFAULT 'active',
+                source          VARCHAR(100),
+                core_lead_id    UUID NULL,
+                metadata        JSONB NOT NULL DEFAULT '{}',
+                is_deleted      BOOLEAN NOT NULL DEFAULT false,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
-            CREATE INDEX IF NOT EXISTS idx_leads_phone ON leads(phone);
-            CREATE INDEX IF NOT EXISTS idx_leads_tenant ON leads(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_wa_contacts_phone  ON wa_contacts(phone)  WHERE is_deleted = false;
+            CREATE INDEX IF NOT EXISTS idx_wa_contacts_tenant ON wa_contacts(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_wa_contacts_email  ON wa_contacts(email)  WHERE email IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_wa_contacts_core   ON wa_contacts(core_lead_id) WHERE core_lead_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS conversations (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                lead_id UUID REFERENCES leads(id),
+                lead_id UUID REFERENCES wa_contacts(id),
                 channel VARCHAR(50) DEFAULT 'whatsapp',
                 status VARCHAR(50) DEFAULT 'active',
                 owner VARCHAR(50) DEFAULT 'AI',
                 human_agent_id VARCHAR(100),
                 started_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW(),
-                metadata JSONB DEFAULT '{}',
+                metadata JSONB NOT NULL DEFAULT '{}',
                 is_favorite BOOLEAN DEFAULT false,
                 is_pinned BOOLEAN DEFAULT false,
                 is_locked BOOLEAN DEFAULT false,
-                is_deleted BOOLEAN DEFAULT false,
+                is_deleted BOOLEAN NOT NULL DEFAULT false,
                 tenant_id UUID NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_conversations_lead ON conversations(lead_id);
-            CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_lead    ON conversations(lead_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_tenant  ON conversations(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
 
             CREATE TABLE IF NOT EXISTS messages (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 conversation_id UUID REFERENCES conversations(id),
-                lead_id UUID REFERENCES leads(id),
+                lead_id UUID REFERENCES wa_contacts(id),
                 role VARCHAR(50) NOT NULL,
                 content TEXT,
                 intent VARCHAR(100),
@@ -412,17 +423,20 @@ async def _ensure_tenant_tables(database_url: str, tenant_id: str, flow_template
                 tenant_id UUID NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_conv   ON messages(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_messages_tenant ON messages(tenant_id);
         """)
 
         # ---- Schema migrations for existing databases ----
-        # Safe ALTER TABLE ADD COLUMN IF NOT EXISTS for new columns
+        # Safe ALTER TABLE ADD COLUMN IF NOT EXISTS for new columns on wa_contacts
         migration_sqls = [
-            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS company VARCHAR(255)",
-            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS stage VARCHAR(100)",
-            "ALTER TABLE leads ADD COLUMN IF NOT EXISTS source VARCHAR(100)",
+            "ALTER TABLE wa_contacts ADD COLUMN IF NOT EXISTS company VARCHAR(255)",
+            "ALTER TABLE wa_contacts ADD COLUMN IF NOT EXISTS stage VARCHAR(100)",
+            "ALTER TABLE wa_contacts ADD COLUMN IF NOT EXISTS source VARCHAR(100)",
+            "ALTER TABLE wa_contacts ADD COLUMN IF NOT EXISTS core_lead_id UUID NULL",
+            "ALTER TABLE wa_contacts ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false",
             "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS channel VARCHAR(50) DEFAULT 'whatsapp'",
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT false",
         ]
         for sql in migration_sqls:
             try:

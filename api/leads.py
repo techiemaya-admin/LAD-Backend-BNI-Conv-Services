@@ -93,12 +93,12 @@ async def import_leads(body: LeadImportRequest, tenant_id: Optional[str] = Depen
                     existing_lead = None
                     if lead_item.phone:
                         existing_lead = await conn.fetchrow(
-                            "SELECT id FROM leads WHERE phone = $1 AND tenant_id = $2",
+                            "SELECT id FROM wa_contacts WHERE phone = $1 AND tenant_id = $2",
                             lead_item.phone, tenant_id,
                         )
                     if not existing_lead and lead_item.email:
                         existing_lead = await conn.fetchrow(
-                            "SELECT id FROM leads WHERE email = $1 AND tenant_id = $2",
+                            "SELECT id FROM wa_contacts WHERE email = $1 AND tenant_id = $2",
                             lead_item.email, tenant_id,
                         )
 
@@ -106,7 +106,7 @@ async def import_leads(body: LeadImportRequest, tenant_id: Optional[str] = Depen
                         lead_id = str(existing_lead["id"])
                         # Update existing lead with new info
                         await conn.execute("""
-                            UPDATE leads SET
+                            UPDATE wa_contacts SET
                                 name = COALESCE($1, name),
                                 company = COALESCE($2, company),
                                 email = COALESCE($3, email),
@@ -118,7 +118,7 @@ async def import_leads(body: LeadImportRequest, tenant_id: Optional[str] = Depen
                     else:
                         # Create new lead
                         lead_row = await conn.fetchrow("""
-                            INSERT INTO leads (name, phone, email, company, channel, stage, status, metadata, tenant_id)
+                            INSERT INTO wa_contacts (name, phone, email, company, channel, stage, status, metadata, tenant_id)
                             VALUES ($1, $2, $3, $4, $5, $6, 'active', $7::jsonb, $8)
                             RETURNING id
                         """, lead_item.name, lead_item.phone, lead_item.email,
@@ -223,7 +223,7 @@ async def list_leads(
                 SELECT l.id, l.name, l.phone, l.email, l.company, l.channel,
                        l.stage, l.status, l.metadata, l.created_at,
                        COUNT(DISTINCT c.id) AS conversation_count
-                FROM leads l
+                FROM wa_contacts l
                 LEFT JOIN conversations c ON c.lead_id = l.id
                     AND (c.is_deleted IS NULL OR c.is_deleted = false)
                 WHERE {' AND '.join(where)}

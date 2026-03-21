@@ -154,7 +154,7 @@ async def get_inactive_leads(
                             AND c.status = 'active' AND c.owner = 'AI'
                             THEN true ELSE false
                         END AS eligible_for_followup
-                    FROM leads l
+                    FROM wa_contacts l
                     JOIN conversations c ON c.lead_id = l.id
                     LEFT JOIN LATERAL (
                         SELECT cm2.*
@@ -213,7 +213,7 @@ async def get_context_stats(tenant_id: Optional[str] = Depends(get_tenant_id)):
                     cm.context_status,
                     COUNT(DISTINCT cm.lead_id) AS lead_count
                 FROM conversation_manager cm
-                JOIN leads l ON l.id = cm.lead_id
+                JOIN wa_contacts l ON l.id = cm.lead_id
                 WHERE cm.id IN (
                     SELECT DISTINCT ON (cm2.lead_id) cm2.id
                     FROM conversation_manager cm2

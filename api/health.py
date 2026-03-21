@@ -14,15 +14,15 @@ router = APIRouter(tags=["health"])
 
 @router.get("/health")
 async def health():
-    bni_ok = False
+    client_db_ok = False
     agent_ok = False
 
     try:
         async with ClientDBConnection() as conn:
             await conn.fetchval("SELECT 1")
-            bni_ok = True
+            client_db_ok = True
     except Exception as e:
-        logger.error(f"BNI DB health check failed: {e}")
+        logger.error(f"Client DB health check failed: {e}")
 
     try:
         async with CoreDBConnection() as conn:
@@ -32,10 +32,10 @@ async def health():
         logger.error(f"Agent DB health check failed: {e}")
 
     return {
-        "status": "ok" if (bni_ok and agent_ok) else "degraded",
-        "service": "bni-conversation-service",
+        "status": "ok" if (client_db_ok and agent_ok) else "degraded",
+        "service": "whatsapp-agent-service",
         "databases": {
-            "salesmaya_bni": "connected" if bni_ok else "disconnected",
+            "client_db": "connected" if client_db_ok else "disconnected",
             "salesmaya_agent": "connected" if agent_ok else "disconnected",
         },
     }

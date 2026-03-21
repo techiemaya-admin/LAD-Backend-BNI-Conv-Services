@@ -235,7 +235,7 @@ async def trigger_manual_followup(
                        cs.context_status, cs.metadata,
                        c.id AS conversation_id, l.id AS lead_id
                 FROM conversation_states cs
-                LEFT JOIN leads l ON l.phone = cs.phone
+                LEFT JOIN wa_contacts l ON l.phone = cs.phone
                 LEFT JOIN conversations c
                     ON c.lead_id = l.id AND c.status = 'active'
                 WHERE cs.phone = $1
@@ -339,7 +339,7 @@ async def send_template_to_members(
                     SELECT cs.phone AS member_phone, cs.contact_name AS member_name,
                            c.id AS conversation_id, l.id AS lead_id
                     FROM conversation_states cs
-                    LEFT JOIN leads l ON l.phone = cs.phone
+                    LEFT JOIN wa_contacts l ON l.phone = cs.phone
                     LEFT JOIN conversations c
                         ON c.lead_id = l.id AND c.status = 'active'
                     WHERE cs.context_status = ANY($1::text[])
@@ -354,7 +354,7 @@ async def send_template_to_members(
                     SELECT cs.phone AS member_phone, cs.contact_name AS member_name,
                            c.id AS conversation_id, l.id AS lead_id
                     FROM conversation_states cs
-                    LEFT JOIN leads l ON l.phone = cs.phone
+                    LEFT JOIN wa_contacts l ON l.phone = cs.phone
                     LEFT JOIN conversations c
                         ON c.lead_id = l.id AND c.status = 'active'
                     WHERE cs.phone = ANY($1::text[])

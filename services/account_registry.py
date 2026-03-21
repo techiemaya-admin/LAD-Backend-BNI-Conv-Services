@@ -19,6 +19,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from db.schema import core_table  # Architecture Rule I.3: no lad_dev.* hardcoding
+
 logger = logging.getLogger(__name__)
 
 _CONFIG_DB_URL = os.getenv(
@@ -132,7 +134,7 @@ async def load_accounts():
     try:
         conn = await asyncpg.connect(_CONFIG_DB_URL)
         rows = await conn.fetch(
-            "SELECT * FROM lad_dev.social_whatsapp_accounts WHERE status = 'active'"
+            f"SELECT * FROM {core_table('social_whatsapp_accounts')} WHERE status = 'active'"
         )
         await conn.close()
 
@@ -169,7 +171,7 @@ async def _load_from_chapters_fallback():
     try:
         conn = await asyncpg.connect(_CONFIG_DB_URL)
         rows = await conn.fetch(
-            "SELECT * FROM lad_dev.chapters WHERE status = 'active'"
+            f"SELECT * FROM {core_table('chapters')} WHERE status = 'active'"
         )
         await conn.close()
 
@@ -191,7 +193,7 @@ async def _load_from_chapters_fallback():
                 ai_model=row["ai_model"] or "gemini-2.5-flash",
                 ai_api_key=row["ai_api_key"],
                 timezone=row["timezone"] or "Asia/Dubai",
-                conversation_flow_template="bni",  # chapters are always BNI
+                conversation_flow_template="bni",  # legacy chapters table defaults to bni flow
                 status=row["status"] or "active",
                 metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (dict(row["metadata"]) if row["metadata"] else {}),
             )
