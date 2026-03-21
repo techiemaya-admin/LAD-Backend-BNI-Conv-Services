@@ -135,7 +135,7 @@ async def _process_personal_message(
             message_text=message_text,
             contact_name=contact_name,
             external_message_id=external_message_id,
-            chapter=account,
+            account=account,
             is_saved_contact=is_saved_contact,
         )
     except Exception as e:

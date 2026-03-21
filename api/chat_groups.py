@@ -255,7 +255,7 @@ async def get_group_detail(group_id: str, tenant_id: Optional[str] = Depends(get
                     c.id AS conversation_id, c.channel
                 FROM chat_group_conversations cgc
                 JOIN conversations c ON c.id = cgc.conversation_id
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 WHERE cgc.group_id = $1::uuid
                 ORDER BY l.id, c.updated_at DESC
             """, group_id)
@@ -338,7 +338,7 @@ async def get_group_messages(
                     COALESCE(c.channel, 'whatsapp') AS channel
                 FROM messages m
                 LEFT JOIN conversations c ON c.id = m.conversation_id
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 WHERE {where}
                 ORDER BY m.created_at DESC
                 LIMIT ${idx}
@@ -414,12 +414,12 @@ async def import_contacts_to_group(
                     lead = None
                     if phone:
                         lead = await conn.fetchrow(
-                            "SELECT id FROM leads WHERE phone = $1 AND tenant_id = $2::uuid",
+                            "SELECT id FROM wa_contacts WHERE phone = $1 AND tenant_id = $2::uuid",
                             phone, tenant_id,
                         )
                     if not lead and email:
                         lead = await conn.fetchrow(
-                            "SELECT id FROM leads WHERE email = $1 AND tenant_id = $2::uuid",
+                            "SELECT id FROM wa_contacts WHERE email = $1 AND tenant_id = $2::uuid",
                             email, tenant_id,
                         )
 
@@ -427,7 +427,7 @@ async def import_contacts_to_group(
                     if not lead:
                         lead = await conn.fetchrow(
                             """
-                            INSERT INTO leads (name, phone, email, source, tenant_id)
+                            INSERT INTO wa_contacts (name, phone, email, source, tenant_id)
                             VALUES ($1, $2, $3, 'crm_import', $4::uuid)
                             RETURNING id
                             """,
@@ -505,7 +505,7 @@ async def send_template_to_group(group_id: str, body: ChatGroupTemplateSend, ten
                 SELECT c.id AS conversation_id, c.lead_id, l.phone,
                        COALESCE(cs.contact_name, l.name) AS name
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = ANY($1::uuid[])
                 """,

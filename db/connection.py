@@ -1,13 +1,14 @@
 """
-Dual-pool database connections for the BNI Conversation Service.
+Dual-pool database connections for the WhatsApp Agent Service.
 
 Two pools:
-  - client_pool → salesmaya_bni (read/write conversations, messages, meetings)
-  - core_pool   → salesmaya_agent (read community_roi_members, relationship_scores)
+  - client_pool → client DB (read/write conversations, messages, wa_contacts)
+  - core_pool   → salesmaya_agent (read tenants, social_whatsapp_accounts, tenant_database_config)
 
 Connection classes:
-  - ClientDBConnection  → salesmaya_bni (client feature tables)
+  - ClientDBConnection  → client DB (client feature tables, legacy single-tenant)
   - CoreDBConnection    → salesmaya_agent (shared/core tables)
+  - AsyncDBConnection   → per-tenant DB (multi-tenant routing via tenant_database_config)
 
 Backward-compatible aliases:
   - BNIDBConnection     = ClientDBConnection
@@ -23,6 +24,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Import schema helper AFTER load_dotenv so env vars are available
+# Avoids hardcoding lad_dev.* in SQL strings (Architecture Rule I.3)
+from db.schema import core_table  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 _client_pool: Optional[asyncpg.Pool] = None
@@ -33,11 +38,12 @@ async def init_pools():
     """Initialize both connection pools."""
     global _client_pool, _core_pool
 
-    client_url = os.getenv("BNI_DB_URL")
+    # Support CLIENT_DB_URL (new generic name) and BNI_DB_URL (legacy backward compat)
+    client_url = os.getenv("CLIENT_DB_URL") or os.getenv("BNI_DB_URL")
     core_url = os.getenv("AGENT_DB_URL")
 
     if not client_url:
-        raise RuntimeError("BNI_DB_URL is not set")
+        raise RuntimeError("CLIENT_DB_URL (or legacy BNI_DB_URL) is not set")
     if not core_url:
         raise RuntimeError("AGENT_DB_URL is not set")
 
@@ -46,16 +52,16 @@ async def init_pools():
         min_size=2,
         max_size=10,
         command_timeout=30,
-        server_settings={"application_name": "bni_conversation_service"},
+        server_settings={"application_name": "wa_agent_service"},
     )
-    logger.info("Client database pool created (salesmaya_bni)")
+    logger.info("Client database pool created")
 
     _core_pool = await asyncpg.create_pool(
         dsn=core_url,
         min_size=1,
         max_size=5,
         command_timeout=30,
-        server_settings={"application_name": "bni_conversation_service_reader"},
+        server_settings={"application_name": "wa_agent_service_reader"},
     )
     logger.info("Core database pool created (salesmaya_agent)")
 
@@ -136,9 +142,10 @@ AgentDBConnection = CoreDBConnection
 # ====================
 
 # Config DB URL (salesmaya_agent, where lad_dev.tenant_database_config lives)
+# NOTE: Always set CONFIG_DB_URL env var in production; this fallback is for local dev only.
 _CONFIG_DB_URL = os.getenv(
     "CONFIG_DB_URL",
-    "postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent",
+    "postgresql://dbadmin:TechieMaya%240326@165.22.221.77:5432/salesmaya_agent",
 )
 
 # Fallback DB URL when no tenant_id is provided
@@ -160,18 +167,36 @@ class TenantNotConfiguredError(Exception):
 
 
 async def _load_tenant_config():
-    """Load tenant-to-database mappings from lad_dev.tenant_database_config."""
+    """Load tenant-to-database mappings from lad_dev.tenant_database_config.
+
+    Also seeds the legacy single-tenant mapping so accounts loaded from the old
+    lad_dev.chapters fallback table still work even if they were never added to
+    tenant_database_config.
+    """
     global _tenant_db_urls
     try:
         conn = await asyncpg.connect(_CONFIG_DB_URL)
         rows = await conn.fetch(
-            "SELECT tenant_id::text, database_url FROM lad_dev.tenant_database_config"
+            f"SELECT tenant_id::text, database_url FROM {core_table('tenant_database_config')}"
         )
         await conn.close()
         _tenant_db_urls = {row["tenant_id"]: row["database_url"] for row in rows}
         logger.info(f"Loaded {len(_tenant_db_urls)} tenant database configs")
     except Exception as e:
         logger.error(f"Failed to load tenant config: {e}")
+
+    # Seed legacy single-tenant mapping.
+    # Tenants originally created via lad_dev.chapters (before tenant_database_config existed)
+    # won't have a row in tenant_database_config.  Map them to CLIENT_DB_URL so the
+    # conversations/messages APIs continue to work without a DB migration.
+    _default_tenant_id = os.getenv("DEFAULT_TENANT_ID") or os.getenv("BNI_TENANT_ID")
+    _client_db_url = os.getenv("CLIENT_DB_URL") or os.getenv("BNI_DB_URL")
+    if _default_tenant_id and _client_db_url and _default_tenant_id not in _tenant_db_urls:
+        _tenant_db_urls[_default_tenant_id] = _client_db_url
+        logger.info(
+            f"Seeded legacy tenant {_default_tenant_id} → CLIENT_DB_URL "
+            f"(not present in tenant_database_config — add a row there to silence this)"
+        )
 
 
 async def _get_or_create_tenant_pool(db_url: str) -> asyncpg.Pool:
@@ -189,7 +214,7 @@ async def _get_or_create_tenant_pool(db_url: str) -> asyncpg.Pool:
             min_size=1,
             max_size=10,
             command_timeout=30,
-            server_settings={"application_name": "bni_conversation_service_tenant"},
+            server_settings={"application_name": "wa_agent_service_tenant"},
         )
         _tenant_pools[db_url] = pool
         return pool
@@ -201,8 +226,20 @@ def _resolve_tenant_db_url(tenant_id: Optional[str]) -> str:
         return _tenant_db_urls[tenant_id]
 
     if tenant_id:
+        # Safety-net fallback: if this tenant is not in tenant_database_config but a
+        # default (legacy) DB URL is set, use it so old single-tenant setups keep working.
+        # In a fully-migrated multi-tenant deployment this branch should never be hit.
+        _client_db_url = os.getenv("CLIENT_DB_URL") or os.getenv("BNI_DB_URL")
+        if _client_db_url:
+            logger.warning(
+                f"Tenant {tenant_id} not found in tenant_database_config. "
+                f"Falling back to CLIENT_DB_URL. "
+                f"Fix: add this tenant via POST /admin/whatsapp-accounts."
+            )
+            return _client_db_url
         raise TenantNotConfiguredError(
-            f"No database configured for tenant {tenant_id}"
+            f"No database configured for tenant {tenant_id}. "
+            f"Register it via POST /admin/whatsapp-accounts."
         )
 
     if _DEFAULT_TENANT_DB_URL:

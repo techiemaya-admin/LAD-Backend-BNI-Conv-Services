@@ -198,7 +198,7 @@ async def list_conversations(
                     (SELECT COUNT(*) FROM messages
                      WHERE conversation_id = c.id) AS message_count
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE {" AND ".join(where_clauses)}
                 ORDER BY c.is_pinned DESC NULLS LAST, {order_clause}
@@ -211,7 +211,7 @@ async def list_conversations(
                 f"""
                 SELECT COUNT(*) AS total
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE {" AND ".join(where_clauses)}
                 """,
@@ -306,8 +306,8 @@ async def list_templates(tenant_id: Optional[str] = Depends(get_tenant_id)):
     """Return approved WhatsApp message templates from Meta API."""
     try:
         # Resolve tenant's WhatsApp account for credentials
-        chapter = get_account_by_tenant_id(tenant_id) if tenant_id else None
-        templates = await get_message_templates(chapter)
+        account = get_account_by_tenant_id(tenant_id) if tenant_id else None
+        templates = await get_message_templates(account)
         logger.info(f"Templates fetched: {len(templates)} templates found (tenant={tenant_id})")
         return {"success": True, "data": templates}
     except Exception as e:
@@ -331,7 +331,7 @@ async def bulk_send_template(
                 SELECT c.id AS conversation_id, c.lead_id, l.phone,
                        COALESCE(cs.contact_name, l.name) AS name
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = ANY($1::uuid[])
                 """,
@@ -547,7 +547,7 @@ async def post_message(
         if not phone_number and lead_id:
             async with AsyncDBConnection(tenant_id) as conn:
                 lead = await conn.fetchrow(
-                    "SELECT phone FROM leads WHERE id = $1::uuid", lead_id
+                    "SELECT phone FROM wa_contacts WHERE id = $1::uuid", lead_id
                 )
                 if lead:
                     phone_number = lead["phone"]
@@ -564,7 +564,7 @@ async def post_message(
             text=content,
             conversation_id=conversation_id,
             lead_id=lead_id,
-            chapter=account,
+            account=account,
         )
 
         if not wa_msg_id:
@@ -612,7 +612,7 @@ async def get_conversation(
                        l.name AS lead_name, l.phone AS lead_phone,
                        cs.context_status
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 LEFT JOIN conversation_states cs ON cs.phone = l.phone
                 WHERE c.id = $1::uuid
                 """,
@@ -793,7 +793,7 @@ async def get_business_profile(
                 """
                 SELECT c.lead_id, l.phone, l.name
                 FROM conversations c
-                LEFT JOIN leads l ON l.id = c.lead_id
+                LEFT JOIN wa_contacts l ON l.id = c.lead_id
                 WHERE c.id = $1::uuid
                 """,
                 conversation_id,

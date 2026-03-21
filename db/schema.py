@@ -4,8 +4,8 @@ Dynamic schema resolution for multi-tenant architecture.
 Core tables (tenants, users, community_roi_*) live in salesmaya_agent
 under a schema resolved from the tenant context.
 
-Client tables (conversations, messages, meetings) live in salesmaya_bni
-under the public schema.
+Client tables (conversations, messages, wa_contacts) live in each tenant's
+own database under the public schema.
 
 Usage:
     from db.schema import core_table, get_tenant_id
@@ -25,8 +25,12 @@ logger = logging.getLogger(__name__)
 # Resolved from environment — never hardcoded in queries.
 _CORE_SCHEMA = os.getenv("CORE_DB_SCHEMA", "lad_dev")
 
-# BNI tenant ID — resolved from environment.
-_TENANT_ID = os.getenv("BNI_TENANT_ID", "9ca4012a-2e02-5593-8cc1-fd5bd81483f9")
+# Default tenant ID — resolved from environment.
+# Supports both DEFAULT_TENANT_ID (new) and BNI_TENANT_ID (legacy backward compat).
+_TENANT_ID = (
+    os.getenv("DEFAULT_TENANT_ID")
+    or os.getenv("BNI_TENANT_ID", "9ca4012a-2e02-5593-8cc1-fd5bd81483f9")
+)
 
 
 def core_table(table_name: str) -> str:

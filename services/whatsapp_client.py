@@ -2,8 +2,8 @@ from __future__ import annotations
 """
 WhatsApp Business API client for sending messages.
 
-Multi-tenant: All public functions accept an optional ChapterConfig.
-When provided, uses chapter-specific WhatsApp credentials.
+Multi-tenant: All public functions accept an optional AccountConfig.
+When provided, uses account-specific WhatsApp credentials.
 Falls back to environment variables for backward compatibility.
 """
 import logging
@@ -18,7 +18,7 @@ import httpx
 from dotenv import load_dotenv
 
 from db.connection import AsyncDBConnection, ClientDBConnection
-from services.account_registry import WhatsAppAccount as ChapterConfig  # backward compat alias
+from services.account_registry import WhatsAppAccount as AccountConfig  # type alias
 
 load_dotenv()
 
@@ -43,13 +43,13 @@ def _get_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def _resolve_creds(chapter: Optional[ChapterConfig] = None) -> tuple[str, str, str]:
-    """Resolve WhatsApp credentials from chapter or env vars.
+def _resolve_creds(account: Optional[AccountConfig] = None) -> tuple[str, str, str]:
+    """Resolve WhatsApp credentials from account or env vars.
     Returns (phone_number_id, access_token, api_url).
     """
-    if chapter and chapter.whatsapp_phone_number_id and chapter.whatsapp_access_token:
-        phone_id = chapter.whatsapp_phone_number_id
-        token = chapter.whatsapp_access_token
+    if account and account.whatsapp_phone_number_id and account.whatsapp_access_token:
+        phone_id = account.whatsapp_phone_number_id
+        token = account.whatsapp_access_token
     else:
         phone_id = _FALLBACK_PHONE_NUMBER_ID
         token = _FALLBACK_ACCESS_TOKEN
@@ -58,18 +58,18 @@ def _resolve_creds(chapter: Optional[ChapterConfig] = None) -> tuple[str, str, s
     return phone_id, token, api_url
 
 
-def _get_headers(chapter: Optional[ChapterConfig] = None) -> dict:
-    if chapter and chapter.whatsapp_access_token:
-        return chapter.whatsapp_headers
+def _get_headers(account: Optional[AccountConfig] = None) -> dict:
+    if account and account.whatsapp_access_token:
+        return account.whatsapp_headers
     return {
         "Authorization": f"Bearer {_FALLBACK_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
 
-def _get_waba_id_sync(chapter: Optional[ChapterConfig] = None) -> str:
-    if chapter and chapter.whatsapp_business_account_id:
-        return chapter.whatsapp_business_account_id
+def _get_waba_id_sync(account: Optional[AccountConfig] = None) -> str:
+    if account and account.whatsapp_business_account_id:
+        return account.whatsapp_business_account_id
     return _FALLBACK_WABA_ID
 
 
@@ -78,9 +78,9 @@ def _normalize_phone_number(phone_number: str) -> str:
     return re.sub(r"\D", "", phone_number or "")
 
 
-async def mark_as_read(message_id: str, chapter: Optional[ChapterConfig] = None) -> None:
+async def mark_as_read(message_id: str, account: Optional[AccountConfig] = None) -> None:
     """Mark an incoming message as read (shows blue ticks)."""
-    phone_id, token, api_url = _resolve_creds(chapter)
+    phone_id, token, api_url = _resolve_creds(account)
     if not phone_id or not token:
         return
     payload = {
@@ -90,7 +90,7 @@ async def mark_as_read(message_id: str, chapter: Optional[ChapterConfig] = None)
     }
     try:
         client = _get_client()
-        await client.post(api_url, headers=_get_headers(chapter), json=payload)
+        await client.post(api_url, headers=_get_headers(account), json=payload)
     except Exception as e:
         logger.debug(f"mark_as_read failed: {e}")
 
@@ -100,10 +100,10 @@ _template_body_cache: dict[str, str] = {}
 _template_cache_loaded_for: set[str] = set()
 
 
-async def get_message_templates(chapter: Optional[ChapterConfig] = None) -> list[dict]:
+async def get_message_templates(account: Optional[AccountConfig] = None) -> list[dict]:
     """Fetch approved message templates from Meta Business API."""
-    waba_id = _get_waba_id_sync(chapter)
-    _, token, _ = _resolve_creds(chapter)
+    waba_id = _get_waba_id_sync(account)
+    _, token, _ = _resolve_creds(account)
 
     if not waba_id or not token:
         logger.warning("Cannot fetch templates: WABA ID or token not available")
@@ -114,7 +114,7 @@ async def get_message_templates(chapter: Optional[ChapterConfig] = None) -> list
         client = _get_client()
         response = await client.get(
             templates_url,
-            headers=_get_headers(chapter),
+            headers=_get_headers(account),
             params={"status": "APPROVED", "limit": 100},
         )
         if response.status_code == 200:
@@ -149,11 +149,11 @@ async def get_message_templates(chapter: Optional[ChapterConfig] = None) -> list
         return []
 
 
-async def _get_template_body(template_name: str, chapter: Optional[ChapterConfig] = None) -> str | None:
-    waba_id = _get_waba_id_sync(chapter)
+async def _get_template_body(template_name: str, account: Optional[AccountConfig] = None) -> str | None:
+    waba_id = _get_waba_id_sync(account)
     cache_key = f"{waba_id}:{template_name}"
     if waba_id not in _template_cache_loaded_for:
-        await get_message_templates(chapter)
+        await get_message_templates(account)
     return _template_body_cache.get(cache_key)
 
 
@@ -164,10 +164,10 @@ async def send_template_message(
     parameters: list[str] | None = None,
     conversation_id: str | None = None,
     lead_id: str | None = None,
-    chapter: Optional[ChapterConfig] = None,
+    account: Optional[AccountConfig] = None,
 ) -> str | None:
     """Send a WhatsApp message using a pre-approved template."""
-    _, _, api_url = _resolve_creds(chapter)
+    _, _, api_url = _resolve_creds(account)
 
     components = []
     if parameters:
@@ -190,14 +190,14 @@ async def send_template_message(
 
     try:
         client = _get_client()
-        response = await client.post(api_url, headers=_get_headers(chapter), json=payload)
+        response = await client.post(api_url, headers=_get_headers(account), json=payload)
 
         if response.status_code in (200, 201):
             resp_data = response.json()
             wa_message_id = resp_data.get("messages", [{}])[0].get("id", "")
             internal_id = str(uuid.uuid4())
 
-            template_body = await _get_template_body(template_name, chapter)
+            template_body = await _get_template_body(template_name, account)
             if template_body and parameters:
                 content = template_body
                 for i, param_val in enumerate(parameters, start=1):
@@ -211,10 +211,10 @@ async def send_template_message(
 
             if conversation_id and lead_id:
                 await _save_outgoing_message(
-                    internal_id, wa_message_id, conversation_id, lead_id, content, chapter
+                    internal_id, wa_message_id, conversation_id, lead_id, content, account
                 )
 
-            slug = chapter.slug if chapter else "default"
+            slug = account.slug if account else "default"
             logger.info(f"[{slug}] Template '{template_name}' sent to {phone_number}: {wa_message_id}")
             return wa_message_id
         else:
@@ -231,10 +231,10 @@ async def send_message(
     text: str,
     conversation_id: str | None = None,
     lead_id: str | None = None,
-    chapter: Optional[ChapterConfig] = None,
+    account: Optional[AccountConfig] = None,
 ) -> str | None:
     """Send a WhatsApp text message and save to DB."""
-    _, _, api_url = _resolve_creds(chapter)
+    _, _, api_url = _resolve_creds(account)
     t0 = time.time()
     normalized_phone = _normalize_phone_number(phone_number)
 
@@ -251,8 +251,8 @@ async def send_message(
 
     try:
         client = _get_client()
-        response = await client.post(api_url, headers=_get_headers(chapter), json=payload)
-        slug = chapter.slug if chapter else "default"
+        response = await client.post(api_url, headers=_get_headers(account), json=payload)
+        slug = account.slug if account else "default"
         logger.info(f"[{slug}][TIMING] whatsapp_api_post: {time.time()-t0:.3f}s")
 
         if response.status_code in (200, 201):
@@ -263,7 +263,7 @@ async def send_message(
             if conversation_id and lead_id:
                 t1 = time.time()
                 await _save_outgoing_message(
-                    internal_id, wa_message_id, conversation_id, lead_id, text, chapter
+                    internal_id, wa_message_id, conversation_id, lead_id, text, account
                 )
                 logger.info(f"[{slug}][TIMING] save_outgoing_message_db: {time.time()-t1:.3f}s")
 
@@ -293,7 +293,7 @@ async def send_message(
                 retry_t0 = time.time()
                 retry_response = await client.post(
                     api_url,
-                    headers=_get_headers(chapter),
+                    headers=_get_headers(account),
                     json=minimal_payload,
                 )
                 logger.info(
@@ -308,7 +308,7 @@ async def send_message(
                     if conversation_id and lead_id:
                         t1 = time.time()
                         await _save_outgoing_message(
-                            internal_id, wa_message_id, conversation_id, lead_id, text, chapter
+                            internal_id, wa_message_id, conversation_id, lead_id, text, account
                         )
                         logger.info(f"[{slug}][TIMING] save_outgoing_message_db: {time.time()-t1:.3f}s")
 
@@ -347,12 +347,12 @@ async def _save_outgoing_message(
     conversation_id: str,
     lead_id: str,
     content: str,
-    chapter: Optional[ChapterConfig] = None,
+    account: Optional[AccountConfig] = None,
 ):
     """Save an outgoing AI message to the messages table."""
     try:
-        if chapter:
-            async with AsyncDBConnection(chapter.tenant_id) as conn:
+        if account:
+            async with AsyncDBConnection(account.tenant_id) as conn:
                 await conn.execute(
                     """
                     INSERT INTO messages (id, conversation_id, lead_id, role, content,
@@ -360,7 +360,7 @@ async def _save_outgoing_message(
                     VALUES ($1::uuid, $2::uuid, $3::uuid, 'agent', $4, 'sent', $5, $6::uuid, NOW())
                     """,
                     internal_id, conversation_id, lead_id, content,
-                    external_message_id, chapter.tenant_id,
+                    external_message_id, account.tenant_id,
                 )
         else:
             async with ClientDBConnection() as conn:
