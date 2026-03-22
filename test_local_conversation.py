@@ -48,17 +48,17 @@ _mock_personal_send = AsyncMock()
 def _setup_mocks():
     """Configure mocks so they return fake message IDs and print the reply."""
 
-    async def mock_wa_send(phone_number, text, conversation_id=None, lead_id=None, chapter=None):
+    async def mock_wa_send(phone_number, text, conversation_id=None, lead_id=None, account=None):
         fake_id = f"wamid.mock_{uuid.uuid4().hex[:12]}"
-        slug = chapter.slug if chapter else "default"
+        slug = account.slug if account else "default"
         print(f"\n  [MOCK BUSINESS WA] -> {phone_number}")
         print(f"  [MOCK BUSINESS WA] msg_id: {fake_id}")
 
         # Still save to DB like the real client does
-        if conversation_id and lead_id and chapter:
+        if conversation_id and lead_id and account:
             from services.whatsapp_client import _save_outgoing_message
             await _save_outgoing_message(
-                str(uuid.uuid4()), fake_id, conversation_id, lead_id, text, chapter
+                str(uuid.uuid4()), fake_id, conversation_id, lead_id, text, account
             )
         return fake_id
 
@@ -149,7 +149,7 @@ async def _send_and_wait(phone: str, message: str, contact_name: str, account):
         message_text=message,
         contact_name=contact_name,
         external_message_id=external_msg_id,
-        chapter=account,
+        account=account,
     )
 
     # Wait for debounce (1s) + LLM processing + send

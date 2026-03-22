@@ -31,8 +31,12 @@ from api.ownership import router as ownership_router
 from api.admin import router as admin_router
 from api.personal_webhook import router as personal_webhook_router
 from api.leads import router as leads_router
+from api.linkedin_webhook import router as linkedin_webhook_router
+from api.instagram_webhook import router as instagram_webhook_router
+from api.gmail_webhook import router as gmail_webhook_router
 from services.account_registry import load_accounts, get_accounts_by_flow
 from modules.bni import register_bni_flow
+from modules.linkedin import register_linkedin_flow
 from modules.bni.tasks import (
     send_meeting_reminders,
     send_post_meeting_followups,
@@ -56,6 +60,7 @@ async def lifespan(app: FastAPI):
 
         # Register flow templates before loading accounts
         register_bni_flow()
+        register_linkedin_flow()
 
         await load_accounts()
         logger.info("WhatsApp account configs loaded")
@@ -118,3 +123,6 @@ app.include_router(ownership_router)
 app.include_router(admin_router)
 app.include_router(personal_webhook_router)
 app.include_router(leads_router)
+app.include_router(linkedin_webhook_router)
+app.include_router(instagram_webhook_router)
+app.include_router(gmail_webhook_router)
