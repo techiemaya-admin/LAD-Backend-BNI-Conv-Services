@@ -23,7 +23,15 @@ from db.connection import AsyncDBConnection
 from services.conversation_engine import process_conversation
 from services import whatsapp_client
 from services import personal_whatsapp_client
+from services import linkedin_client
+from services import instagram_client
+from services import gmail_client
 from services.account_registry import WhatsAppAccount, CHANNEL_BUSINESS, CHANNEL_PERSONAL
+
+# Multi-channel constants
+CHANNEL_LINKEDIN = "linkedin"
+CHANNEL_INSTAGRAM = "instagram"
+CHANNEL_GMAIL = "gmail"
 
 logger = logging.getLogger(__name__)
 
@@ -226,14 +234,19 @@ async def _prepare_message_context(
         else:
             lead_id = str(uuid.uuid4())
             name = contact_name or phone_number
+            # Derive channel for wa_contacts: use account's channel, defaulting to 'whatsapp'
+            contact_channel = account.metadata.get("channel", "whatsapp")
+            if contact_channel in (CHANNEL_BUSINESS, CHANNEL_PERSONAL):
+                contact_channel = "whatsapp"
             await conn.execute(
                 """
                 INSERT INTO wa_contacts (id, name, phone, channel, status, tenant_id, created_at, updated_at)
-                VALUES ($1::uuid, $2, $3, 'whatsapp', 'active', $4::uuid, NOW(), NOW())
+                VALUES ($1::uuid, $2, $3, $4, 'active', $5::uuid, NOW(), NOW())
                 """,
                 lead_id,
                 name,
                 phone_number,
+                contact_channel,
                 account.tenant_id,
             )
 
@@ -258,11 +271,13 @@ async def _prepare_message_context(
         )
 
         # 3) Conversation — scoped by channel so the same lead gets separate
-        #    conversations for business vs personal WhatsApp.
+        #    conversations for business vs personal WhatsApp, LinkedIn, Instagram, Gmail.
         channel = account.metadata.get("channel", CHANNEL_BUSINESS)
         # Legacy rows have channel='whatsapp' or NULL — treat as business_whatsapp
         if channel == CHANNEL_PERSONAL:
             channel_filter = "AND channel = 'personal_whatsapp'"
+        elif channel in (CHANNEL_LINKEDIN, CHANNEL_INSTAGRAM, CHANNEL_GMAIL):
+            channel_filter = f"AND channel = '{channel}'"
         else:
             channel_filter = "AND COALESCE(channel, 'whatsapp') IN ('whatsapp', 'business_whatsapp')"
         conv_row = await conn.fetchrow(
@@ -344,16 +359,38 @@ async def _prepare_message_context(
             conv_id = str(uuid.uuid4())
             owner = auto_assign_owner or "AI"
 
+            # Build conversation metadata — store channel-specific routing info
+            import json as _json_mod
+            conv_metadata: dict = {}
+            if channel in (CHANNEL_LINKEDIN, CHANNEL_INSTAGRAM):
+                unipile_conv_id = account.metadata.get("unipile_conversation_id", "")
+                unipile_acct_id = account.metadata.get("unipile_account_id", "")
+                if unipile_conv_id:
+                    conv_metadata["unipile_conversation_id"] = unipile_conv_id
+                if unipile_acct_id:
+                    conv_metadata["unipile_account_id"] = unipile_acct_id
+            elif channel == CHANNEL_GMAIL:
+                gmail_thread = account.metadata.get("gmail_thread_id", "")
+                gmail_email = account.metadata.get("gmail_account_email", "")
+                subject = account.metadata.get("email_subject", "")
+                if gmail_thread:
+                    conv_metadata["gmail_thread_id"] = gmail_thread
+                if gmail_email:
+                    conv_metadata["gmail_account_email"] = gmail_email
+                if subject:
+                    conv_metadata["email_subject"] = subject
+
             await conn.execute(
                 """
                 INSERT INTO conversations (id, lead_id, channel, status, owner, metadata, tenant_id, started_at, updated_at)
-                VALUES ($1::uuid, $2::uuid, $3, 'active', $4, '{}', $5::uuid, NOW(), NOW())
+                VALUES ($1::uuid, $2::uuid, $3, 'active', $4, $6::jsonb, $5::uuid, NOW(), NOW())
                 """,
                 conv_id,
                 lead_id,
                 channel,
                 owner,
                 account.tenant_id,
+                _json_mod.dumps(conv_metadata),
             )
 
         # 4) Save incoming + bump timestamp
@@ -395,9 +432,12 @@ async def handle_incoming_message(
         logger.debug(f"[{account.slug}] Duplicate message {external_message_id}, skipping")
         return
 
-    # Mark message as read immediately (blue ticks) — skip for personal WhatsApp
-    is_personal = account.metadata.get("channel") == "personal_whatsapp"
-    if not is_personal:
+    # Mark message as read immediately (blue ticks) — only for business WhatsApp
+    channel_val = account.metadata.get("channel", CHANNEL_BUSINESS)
+    is_business_wa = channel_val not in (
+        CHANNEL_PERSONAL, CHANNEL_LINKEDIN, CHANNEL_INSTAGRAM, CHANNEL_GMAIL
+    )
+    if is_business_wa:
         asyncio.create_task(whatsapp_client.mark_as_read(external_message_id, account=account))
 
     # Step 1-4: Prepare lead/conversation + dedup + save in one DB connection
@@ -527,19 +567,105 @@ async def _send_reply(
 ) -> bool:
     """Route reply to the correct channel client.
 
-    For personal WhatsApp (Baileys), sends via LAD_backend.
-    For business WhatsApp (Cloud API), sends via Meta Graph API.
+    Channels:
+      - personal_whatsapp: via LAD_backend Baileys bridge
+      - business_whatsapp: via Meta Cloud API
+      - linkedin: via LAD_backend → Unipile chat endpoint
+      - instagram: via LAD_backend → Unipile chat endpoint
+      - gmail: via LAD_backend → Gmail API thread reply
 
     Returns:
         True if message was sent successfully, False otherwise.
     """
     channel = account.metadata.get("channel", "business_whatsapp")
     slug = account.slug
+    lad_backend_url = account.metadata.get("lad_backend_url") or None
 
     try:
-        if channel == "personal_whatsapp":
+        # ── LinkedIn ───────────────────────────────────────────────────────────
+        if channel == CHANNEL_LINKEDIN:
+            unipile_conv_id = account.metadata.get("unipile_conversation_id", "")
+            unipile_acct_id = account.metadata.get("unipile_account_id", "")
+
+            if not unipile_conv_id:
+                # Fall back: load from conversation metadata in DB
+                unipile_conv_id = await _get_conv_metadata_field(
+                    conversation_id, "unipile_conversation_id", account,
+                )
+
+            if not unipile_conv_id:
+                logger.error(
+                    f"[{slug}] Missing unipile_conversation_id for LinkedIn reply",
+                    extra={"phone_number": phone_number}
+                )
+                return False
+
+            logger.info(f"[{slug}] Sending via LinkedIn channel")
+            return await linkedin_client.send_message(
+                unipile_conversation_id=unipile_conv_id,
+                message_text=text,
+                unipile_account_id=unipile_acct_id,
+                lad_backend_url=lad_backend_url,
+            )
+
+        # ── Instagram ──────────────────────────────────────────────────────────
+        elif channel == CHANNEL_INSTAGRAM:
+            unipile_conv_id = account.metadata.get("unipile_conversation_id", "")
+            unipile_acct_id = account.metadata.get("unipile_account_id", "")
+
+            if not unipile_conv_id:
+                unipile_conv_id = await _get_conv_metadata_field(
+                    conversation_id, "unipile_conversation_id", account,
+                )
+
+            if not unipile_conv_id:
+                logger.error(
+                    f"[{slug}] Missing unipile_conversation_id for Instagram reply",
+                    extra={"phone_number": phone_number}
+                )
+                return False
+
+            logger.info(f"[{slug}] Sending via Instagram channel")
+            return await instagram_client.send_message(
+                unipile_conversation_id=unipile_conv_id,
+                message_text=text,
+                unipile_account_id=unipile_acct_id,
+                lad_backend_url=lad_backend_url,
+            )
+
+        # ── Gmail ──────────────────────────────────────────────────────────────
+        elif channel == CHANNEL_GMAIL:
+            gmail_thread_id = account.metadata.get("gmail_thread_id", "")
+            gmail_account_email = account.metadata.get("gmail_account_email", "")
+            email_subject = account.metadata.get("email_subject", "")
+            gmail_tenant_id = account.metadata.get("gmail_tenant_id", account.tenant_id)
+
+            if not gmail_thread_id:
+                gmail_thread_id = await _get_conv_metadata_field(
+                    conversation_id, "gmail_thread_id", account,
+                )
+
+            if not gmail_thread_id or not gmail_account_email:
+                logger.error(
+                    f"[{slug}] Missing gmail_thread_id or gmail_account_email for Gmail reply",
+                    extra={"phone_number": phone_number}
+                )
+                return False
+
+            logger.info(f"[{slug}] Sending via Gmail channel")
+            return await gmail_client.send_reply(
+                gmail_thread_id=gmail_thread_id,
+                message_text=text,
+                gmail_account_email=gmail_account_email,
+                tenant_id=gmail_tenant_id,
+                subject=email_subject,
+                to_email=phone_number,   # phone_number = from_email for Gmail channel
+                lad_backend_url=lad_backend_url,
+            )
+
+        # ── Personal WhatsApp ──────────────────────────────────────────────────
+        elif channel == CHANNEL_PERSONAL:
             personal_account_id = account.metadata.get("personal_account_id", "")
-            lad_backend_url = account.metadata.get("lad_backend_url") or None
 
             if not personal_account_id:
                 logger.error(
@@ -575,6 +701,8 @@ async def _send_reply(
                     extra={"to": phone_number, "text_len": len(text)}
                 )
                 return False
+
+        # ── Business WhatsApp (default) ────────────────────────────────────────
         else:
             logger.info(
                 f"[{slug}] Sending via business WhatsApp channel",
@@ -609,3 +737,24 @@ async def _send_reply(
             extra={"channel": channel}
         )
         return False
+
+
+async def _get_conv_metadata_field(
+    conversation_id: str, field: str, account: WhatsAppAccount,
+) -> str:
+    """Fetch a single field from conversation.metadata JSONB."""
+    import json as _json
+    try:
+        async with AsyncDBConnection(account.tenant_id) as conn:
+            row = await conn.fetchrow(
+                "SELECT metadata FROM conversations WHERE id = $1::uuid",
+                conversation_id,
+            )
+            if row and row["metadata"]:
+                meta = row["metadata"]
+                if isinstance(meta, str):
+                    meta = _json.loads(meta)
+                return meta.get(field, "")
+    except Exception as e:
+        logger.error(f"[message_handler] Error fetching conv metadata: {e}")
+    return ""
