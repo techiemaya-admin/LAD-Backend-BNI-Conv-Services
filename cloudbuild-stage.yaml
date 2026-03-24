@@ -34,7 +34,7 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', 'gcr.io/$PROJECT_ID/bni-conversation-service-stage:latest']
 
-  # Deploy to Cloud Run with automatic deployment for stage branch
+  # Deploy to Cloud Run — staging (lad-stage-484806)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
@@ -42,29 +42,34 @@ steps:
       - |
         set -e
         echo "========================================"
-        echo "Starting Cloud Run deployment..."
+        echo "Starting Cloud Run deployment (STAGE)"
         echo "Service: $_SERVICE_NAME"
-        echo "Region: $_REGION"
-        echo "Image: gcr.io/$PROJECT_ID/bni-conversation-service-stage:$COMMIT_SHA"
+        echo "Region : $_REGION"
+        echo "Image  : gcr.io/$PROJECT_ID/bni-conversation-service-stage:$COMMIT_SHA"
+        echo "Project: $PROJECT_ID"
         echo "========================================"
-        
+
         BRANCH_LOWER=$(cat /workspace/branch_lower.txt)
-        
+
         # Create env vars file to handle special characters properly
         cat > /workspace/env-vars.yaml <<EOF
         BNI_DB_URL: "$_BNI_DB_URL"
         AGENT_DB_URL: "$_AGENT_DB_URL"
+        POSTGRES_DB_URL: "$_AGENT_DB_URL"
+        CONFIG_DB_URL: "$_AGENT_DB_URL"
         BNI_TENANT_ID: "$_BNI_TENANT_ID"
+        ORGANIZATION_ID: "$_BNI_TENANT_ID"
         ENVIRONMENT: "staging"
         BRANCH: "$BRANCH_NAME"
         COMMIT_SHA: "$SHORT_SHA"
         BUILD_ID: "$BUILD_ID"
+        LAD_BACKEND_URL: "$_LAD_BACKEND_URL"
         EOF
-        
+
         echo "Env vars file created:"
         cat /workspace/env-vars.yaml
         echo ""
-        
+
         gcloud run deploy $_SERVICE_NAME \
           --image gcr.io/$PROJECT_ID/bni-conversation-service-stage:$COMMIT_SHA \
           --region $_REGION \
@@ -78,18 +83,19 @@ steps:
           --timeout 300 \
           --port 8080 \
           --env-vars-file /workspace/env-vars.yaml \
-          --update-labels branch=$${BRANCH_LOWER},commit-sha=$SHORT_SHA,managed-by=cloud-build
-        
+          --update-labels environment=staging,branch=$${BRANCH_LOWER},commit-sha=$SHORT_SHA,managed-by=cloud-build
+
         echo "========================================"
         echo "✓ Deployment completed successfully!"
+        echo "✓ Service: $_SERVICE_NAME"
         echo "========================================"
 
 # Build configuration
 options:
-  machineType: 'N1_HIGHCPU_8'
+  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY
-  sourceProvenanceHash:
-    - SHA256
+  substitutionOption: 'ALLOW_LOOSE'
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
 
 # Images to push to Container Registry
 images:
@@ -99,17 +105,22 @@ images:
   - 'gcr.io/$PROJECT_ID/bni-conversation-service-stage:latest'
 
 # Timeout
-timeout: 1800s
+timeout: '1200s'
 
 # Substitutions
 substitutions:
   _REGION: 'us-central1'
   _SERVICE_NAME: 'bni-conversation-service-stage'
-  _BNI_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_bni'
-  _AGENT_DB_URL: 'postgresql://dbadmin:TechieMaya@165.22.221.77:5432/salesmaya_agent'
+  _BNI_DB_URL: 'postgresql://dbadmin:TechieMaya$0326@165.22.221.77:5432/salesmaya_bni'
+  _AGENT_DB_URL: 'postgresql://dbadmin:TechieMaya$0326@165.22.221.77:5432/salesmaya_agent'
   _BNI_TENANT_ID: '9ca4012a-2e02-5593-8cc1-fd5bd81483f9'
+  _LAD_BACKEND_URL: 'https://lad-backend-stage-REPLACE_WITH_PROJECT_NUMBER.us-central1.run.app'
 
-# Trigger configuration (applied in Cloud Console)
-# Trigger on: Push to stage branch
-# Branch: ^stage$
-# Note: For production, migrate credentials to Google Secret Manager instead of hardcoding
+# Cloud Build trigger configuration (set in Cloud Console):
+# - Source repository: LAD-conversation-service
+# - Branch filter   : ^stage$
+# - Config file     : cloudbuild-stage.yaml
+# - Approval        : optional (recommended for staging)
+#
+# Note: Database passwords are hardcoded here for convenience. For production,
+# migrate DB credentials to Google Secret Manager and use --set-secrets.
